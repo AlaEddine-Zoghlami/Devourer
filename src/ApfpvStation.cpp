@@ -58,13 +58,26 @@ bool ApfpvStation::runConnectChain() {
     if (bad) { self.b[0]=0x02; self.b[1]=0x11; self.b[2]=0x22;
                self.b[3]=0x33; self.b[4]=0x44; self.b[5]=0x55; }
 
-    // Bring the PHY/RF up BEFORE any channel change. scanForSsid (and the arm
-    // path) call set_channel_bwmode -> phy_SwChnl8812, which dereferences null
-    // PHY state if the device was never Init'd -> SIGSEGV. Init once here with a
-    // no-op RX; the real RxDeframe RX is (re)wired after the handshake below.
+    // Bring the PHY/RF up BEFORE any channel change (scanForSsid + arm call
+    // set_channel_bwmode -> phy_SwChnl8812, which null-derefs if never Init'd),
+    // AND wire the RX so discovery (beacons -> onScanFrame) and the arm handshake
+    // (auth/assoc/deauth -> onMgmtFrame) actually receive. Previously this used a
+    // no-op processor, so _scanResult and _gotAuthResp were never set -> the link
+    // always failed at discovery. The real RxDeframe RX is wired after handshake.
     if (_rtl) {
+        StationMode* sp = &sta;
         try {
-            reinterpret_cast<RtlJaguarDevice*>(_rtl)->Init([](const Packet&){},
+            reinterpret_cast<RtlJaguarDevice*>(_rtl)->Init(
+                [sp](const Packet& pkt){
+                    const uint8_t* f = pkt.Data.data(); size_t n = pkt.Data.size();
+                    if (n < 24) return;
+                    uint16_t fc = (uint16_t)(f[0] | (f[1] << 8));
+                    sp->onScanFrame(f, n);              // beacons -> _scanResult
+                    MacAddr a1{}, a2{};
+                    std::memcpy(a1.b.data(), f + 4,  6);
+                    std::memcpy(a2.b.data(), f + 10, 6);
+                    sp->onMgmtFrame(fc, a1, a2);        // auth/assoc/deauth -> flags
+                },
                 SelectedChannel{ .Channel=(uint8_t)(_params.channel > 0 ? _params.channel : 40),
                                  .ChannelOffset=0, .ChannelWidth=CHANNEL_WIDTH_20 });
         } catch (...) {}

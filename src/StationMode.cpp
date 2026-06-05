@@ -118,8 +118,17 @@ void StationMode::onScanFrame(const uint8_t* frame, size_t len) {
 ApInfo StationMode::scanForSsid(const char* ssid, int channelHint, int perChannelMs) {
     using namespace std::chrono;
     _scanSsid = ssid; _scanResult = ApInfo{};
-    // 5GHz UNII-1 channels the EMAX VTX uses (36,40,44,48) + the hint first.
-    int channels[] = { channelHint, 36, 40, 44, 48 };
+    // Order = likelihood for a LEGAL APFPV link first, then catch-all:
+    //   1) hint (the configured/last APFPV channel)
+    //   2) 5.2 GHz UNII-1 (36/40/44/48) — the legal DE 200 mW @ 20 MHz APFPV band
+    //      (PSD cap 10 mW/MHz x 20 MHz = 200 mW). A compliant VTX lives here.
+    //   3) the rest of 5 GHz (UNII-2A/2C DFS, UNII-3 149-165) + common 2.4 GHz,
+    //      so we can still find a test hotspot/router parked off the legal band.
+    int channels[] = { channelHint,
+                       36, 40, 44, 48,                 // UNII-1 — legal DE 200 mW
+                       52, 56, 60, 64,                 // UNII-2A (DFS)
+                       149, 153, 157, 161, 165,        // UNII-3
+                       1, 6, 11 };                     // 2.4 GHz (common)
     for (int ch : channels) {
         if (ch <= 0) continue;
         _rm.set_channel_bwmode((uint8_t)ch, 0, CHANNEL_WIDTH_20);  // tune radio (devourer API)
