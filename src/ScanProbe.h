@@ -26,6 +26,10 @@ public:
     // Parse a received beacon/probe-resp frame for the target SSID. Returns true
     // and fills 'out' when the SSID matches. Feed RX mgmt frames here during scan.
     static bool parseBeacon(const uint8_t* frame, size_t len, const std::string& ssid, ApInfo& out);
+    // Parse ANY beacon/probe-resp (no target filter) for an all-SSID scan:
+    // returns true for a valid mgmt beacon with a non-empty SSID and fills
+    // ssidOut + out (bssid / channel / RSN). Used by ApfpvStation::scanAll.
+    static bool parseAnyBeacon(const uint8_t* frame, size_t len, std::string& ssidOut, ApInfo& out);
     // Pick the strongest pairwise cipher we support from the AP's advertised set.
     static uint32_t chooseCipher(const std::vector<uint32_t>& advertised);
 };

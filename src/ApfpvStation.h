@@ -7,6 +7,9 @@
 #include <thread>
 #include <memory>
 #include <chrono>
+#include <mutex>
+#include <set>
+#include "ScanProbe.h"
 namespace apfpv {
 using Mac = std::array<uint8_t,6>;
 // Top-level APFPV station orchestrator: assembles arming -> auth/assoc ->
@@ -48,6 +51,14 @@ public:
     ~ApfpvStation();
     bool connect(const Params& p);   // runs the chain + starts the supervisor
     void disconnect();               // stops supervisor + tears down
+
+    // All-SSID RF scan for the UI picker. Channel-hops the APFPV/5GHz/2.4 set,
+    // parses every beacon, and calls onAp(ssid, info) once per NEW SSID as it is
+    // discovered (live updates). Runs synchronously — call it from a worker
+    // thread, and only while NOT connected (it drives the RX path). Requires
+    // setDevice() to have been called.
+    using OnApFn = std::function<void(const std::string&, const ApInfo&)>;
+    void scanAll(int perChannelMs, const OnApFn& onAp);
     State state() const { return _state.load(); }
     int   rssiDbm() const { return _rssi.load(); }
     // RX path calls this on every received data/beacon frame so the supervisor
@@ -76,5 +87,11 @@ private:
     std::atomic<bool> _deauth{false};
     std::atomic<bool> _run{false};   // supervisor running
     std::thread _supervisor;
+    // scanAll() state — the RX collector runs on the device thread, so access is
+    // mutex-guarded and _onScanAp is cleared before scanAll returns so the still-
+    // running RX thread can never call into a destroyed callback.
+    std::mutex _scanMtx;
+    std::set<std::string> _scanSeen;
+    OnApFn _onScanAp;
 };
 }

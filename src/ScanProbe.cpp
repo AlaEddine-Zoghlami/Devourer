@@ -8,7 +8,10 @@ namespace apfpv {
 
 static uint32_t suite(const uint8_t* p){ return (p[0]<<24)|(p[1]<<16)|(p[2]<<8)|p[3]; }
 
-bool ScanProbe::parseBeacon(const uint8_t* f, size_t len, const std::string& ssid, ApInfo& out) {
+// Walk a beacon/probe-resp's IEs once, extracting SSID + channel + RSN. Returns
+// false if the frame isn't a valid mgmt beacon/probe-resp. ssidOut may be empty
+// (hidden SSID). Shared by parseBeacon (target filter) and parseAnyBeacon.
+bool ScanProbe::parseAnyBeacon(const uint8_t* f, size_t len, std::string& ssidOut, ApInfo& out) {
     if (len < 36) return false;
     uint16_t fc = f[0] | (f[1] << 8);
     if (((fc >> 2) & 0x3) != 0x0) return false;            // mgmt
@@ -41,8 +44,16 @@ bool ScanProbe::parseBeacon(const uint8_t* f, size_t len, const std::string& ssi
         }
         i += 2 + l;
     }
-    if (foundSsid != ssid) return false;
     tmp.channel = channel; tmp.found = true;
+    ssidOut = foundSsid;
+    out = tmp;
+    return true;
+}
+
+bool ScanProbe::parseBeacon(const uint8_t* f, size_t len, const std::string& ssid, ApInfo& out) {
+    std::string found; ApInfo tmp;
+    if (!parseAnyBeacon(f, len, found, tmp)) return false;
+    if (found != ssid) return false;
     out = tmp;
     return true;
 }

@@ -201,4 +201,47 @@ void ApfpvStation::disconnect() {
     set(State::Idle);
 }
 
+// All-SSID scan: tune the radio across the channel set, collect every beacon,
+// and emit each NEW SSID. The RX collector runs on the device read thread; it
+// captures only `this`, and _onScanAp is cleared (and the processor swapped to a
+// no-op) before we return, so the still-running RX thread can't call a dead cb.
+void ApfpvStation::scanAll(int perChannelMs, const OnApFn& onAp) {
+    if (!_rtl || !_rm) return;
+    auto* rtl = reinterpret_cast<RtlJaguarDevice*>(_rtl);
+    auto& rm  = *reinterpret_cast<RadioManagementModule*>(_rm);
+
+    { std::lock_guard<std::mutex> lk(_scanMtx); _scanSeen.clear(); _onScanAp = onAp; }
+    set(State::Scanning);
+
+    auto collector = [this](const Packet& pkt) {
+        std::string ssid; ApInfo info;
+        if (!ScanProbe::parseAnyBeacon(pkt.Data.data(), pkt.Data.size(), ssid, info)) return;
+        if (ssid.empty()) return;                       // skip hidden SSIDs
+        info.rssi = (int)pkt.RxAtrib.rssi[0] - 110;     // approx dBm (gain byte)
+        std::lock_guard<std::mutex> lk(_scanMtx);
+        if (_onScanAp && _scanSeen.insert(ssid).second) _onScanAp(ssid, info);
+    };
+
+    // hint first, then 5GHz UNII-1 (APFPV/EMAX), upper-5GHz UNII-3, then 2.4.
+    const int channels[] = { _params.channel, 36, 40, 44, 48,
+                             149, 153, 157, 161, 1, 6, 11 };
+    int last = 36; bool inited = false;
+    for (int ch : channels) {
+        if (ch <= 0) continue;
+        last = ch;
+        SelectedChannel sc{ .Channel=(uint8_t)ch, .ChannelOffset=0,
+                            .ChannelWidth=CHANNEL_WIDTH_20 };
+        if (!inited) { rtl->Init(collector, sc); inited = true; }  // starts RX
+        else         { rm.set_channel_bwmode((uint8_t)ch, 0, CHANNEL_WIDTH_20); }
+        std::this_thread::sleep_for(std::chrono::milliseconds(perChannelMs));
+    }
+
+    // Detach: no further emits, and replace the RX processor so the device's
+    // read thread can't re-enter the collector after onAp's lifetime ends.
+    { std::lock_guard<std::mutex> lk(_scanMtx); _onScanAp = nullptr; }
+    rtl->Init([](const Packet&){}, SelectedChannel{ .Channel=(uint8_t)last,
+              .ChannelOffset=0, .ChannelWidth=CHANNEL_WIDTH_20 });
+    set(State::Idle);
+}
+
 } // namespace apfpv
