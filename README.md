@@ -1,4 +1,4 @@
-# devourer
+# devourer — APFPV fork
 
 The Realtek 11ac driver that simply devours its competitors.
 
@@ -7,9 +7,19 @@ driver (Jaguar family: RTL8812AU and RTL8821AU shipping on every band,
 RTL8811AU supported via the 8812 code path, RTL8814AU with band-
 specific gaps — see table below), speaking to the chip directly
 through libusb. No kernel module, no `rtl8812au` DKMS tree — just a
-C++20 static library (`WiFiDriver`) plus two demo executables for RX
-and TX. It is the OpenIPC project's driver of choice for long-range
-video links built on top of cheap Realtek 11ac USB radios.
+C++20 static library (`WiFiDriver`) plus demo executables for RX, TX
+and the APFPV station probe. It is the OpenIPC project's driver of
+choice for long-range video links built on top of cheap Realtek 11ac
+USB radios.
+
+> **This is the [APFPV](https://github.com/AlaEddine-Zoghlami/Devourer) fork of
+> [openipc/devourer](https://github.com/openipc/devourer).** On top of the stock
+> monitor-mode RX/TX driver it adds a full **station-mode stack** — register-only
+> association, a WPA2 supplicant, scan/probe, 802.11 framing, DHCP and link-quality
+> feedback — so the chip can hold a real WPA2 link to an air unit from userspace
+> without kernel MLME. See [APFPV station mode](#apfpv-station-mode) below. It is
+> consumed as a git submodule by the
+> [PixelPilot APFPV fork](https://github.com/AlaEddine-Zoghlami/PixelPilot).
 
 ## Hardware landscape
 
@@ -87,6 +97,12 @@ root.
   fd passed as `argv[1]` (the Termux-on-Android pattern using
   `libusb_wrap_sys_device`). Forks RX into a child, TX-loops a hardcoded
   beacon in the parent.
+- `ApfpvProbe` — APFPV station-mode probe built from `demo/apfpv_probe.cpp`.
+  The empirical **ACK-survival gate**: does the RTL8812AU auto-ACK in station
+  mode when armed purely via registers (no kernel MLME)? Run it on a Linux
+  laptop with an AU dongle against an air unit and read the verdict
+  (`GO_LinkHeld` / `NOGO_Deauthed` / `TXFAIL_NoAuthResp`). See
+  [`BUILD_AND_TEST.md`](BUILD_AND_TEST.md) for the full runbook.
 
 ### Demo env vars
 
@@ -137,6 +153,38 @@ header before the TX loop:
   VHT info field (bit 21). Exposes `DEVOURER_TX_VHT_MCS=N` (VHT MCS
   index, 0..9 typical) and `DEVOURER_TX_VHT_NSS=N` (spatial streams).
   `_LDPC` / `_STBC` / `_BW` apply to whichever (HT/VHT) mode is active.
+
+## APFPV station mode
+
+The fork layers a register-only **station** path on top of the base driver, so
+the radio can associate and hold a WPA2 link to an air unit entirely from
+userspace. The added pieces live in `src/`:
+
+| Component | Role |
+| --------- | ---- |
+| `StationMode` / `ApfpvStation` | Station bring-up, association state machine, link supervision |
+| `Wpa2Supplicant` / `Wpa2Crypto` | 4-way handshake and key management |
+| `crypto/Sha1Hmac`, `crypto/AesCcm` | PBKDF2-WPA2 / HMAC-SHA1 and AES-CCM primitives |
+| `ScanProbe` | Active scan + probe-request negotiation |
+| `Dot11Frames` | 802.11 management/data frame builders + parsers |
+| `RxDeframe` | Station RX path: 802.11 → payload, real-RSSI extraction |
+| `StationTxDesc` | Station TX descriptor layout |
+| `ApfpvDhcp` | Minimal DHCP client for the air-unit link |
+| `LqFeedback` | Link-quality feedback channel |
+
+### Offline crypto verification (no hardware)
+
+The WPA2 crypto primitives are checked against canonical vectors with nothing
+but a C++17 compiler — no libusb, no radio:
+
+```sh
+g++ -std=c++17 -Isrc tests/crypto_test.cpp src/crypto/Sha1Hmac.cpp src/crypto/AesCcm.cpp -o ctest
+./ctest
+# SHA1(abc): OK / HMAC-SHA1: OK / PBKDF2 WPA2: OK / AES-CCM roundtrip: OK
+```
+
+The on-hardware gate (`ApfpvProbe`) and the full bring-up order are documented
+in [`BUILD_AND_TEST.md`](BUILD_AND_TEST.md).
 
 ## Using the library
 
@@ -204,8 +252,21 @@ src/      Driver implementation
           RtlUsbAdapter          libusb wrapper (vendor + bulk transfers)
           FrameParser            RX parsing, TX descriptor layout
           Radiotap.c             radiotap header iterator
-demo/     RX example
+
+          --- APFPV station stack (fork) ---
+          StationMode/ApfpvStation   register-only association + supervision
+          Wpa2Supplicant/Wpa2Crypto  WPA2 4-way handshake + keys
+          crypto/Sha1Hmac, AesCcm    HMAC-SHA1 / PBKDF2 / AES-CCM primitives
+          ScanProbe                  active scan + probe negotiation
+          Dot11Frames                802.11 frame builders / parsers
+          RxDeframe                  station RX deframing + real RSSI
+          StationTxDesc              station TX descriptor layout
+          ApfpvDhcp                  minimal DHCP client
+          LqFeedback                 link-quality feedback channel
+demo/     RX example + apfpv_probe.cpp (ACK-survival gate)
 txdemo/   TX example (Android / Termux pattern)
+tests/    crypto vectors + cross-driver regression rig
+android/  Android glue (ApfpvStaLink JNI, gsmenu sources) for the PixelPilot fork
 ```
 
 ## License
