@@ -237,6 +237,7 @@ static inline bool isDfsChannel(int ch) {
 void ApfpvStation::scanAll(int perChannelMs, bool includeDfs, const OnApFn& onAp) {
     if (!_rtl || !_rm) return;
     auto* rtl = reinterpret_cast<RtlJaguarDevice*>(_rtl);
+    auto& rm  = *reinterpret_cast<RadioManagementModule*>(_rm);
 
     { std::lock_guard<std::mutex> lk(_scanMtx); _scanSeen.clear(); _onScanAp = onAp; }
     set(State::Scanning);
@@ -259,13 +260,14 @@ void ApfpvStation::scanAll(int perChannelMs, bool includeDfs, const OnApFn& onAp
     // hint first, then the full 5GHz set (UNII-1, UNII-2A/2C DFS, UNII-3) and all
     // 2.4GHz channels — APs (incl. phone hotspots/home routers) can sit anywhere,
     // e.g. DFS ch52-144. Passive RX-only listening on DFS is fine (no TX).
+    // Trimmed for the ~per-channel cost of a real retune: UNII-1, UNII-2A DFS,
+    // UNII-3 + the common 2.4 channels. (Dropped the big UNII-2C 100-144 block.)
     const int channels[] = {
         _params.channel,
-        36, 40, 44, 48,                                              // UNII-1
-        52, 56, 60, 64,                                              // UNII-2A (DFS)
-        100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, // UNII-2C (DFS)
-        149, 153, 157, 161, 165,                                     // UNII-3
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13                    // 2.4GHz
+        36, 40, 44, 48,            // UNII-1
+        52, 56, 60, 64,            // UNII-2A (DFS)
+        149, 153, 157, 161, 165,   // UNII-3
+        1, 6, 11                   // 2.4GHz (common)
     };
     int last = 36; bool inited = false;
     for (int ch : channels) {
@@ -278,8 +280,8 @@ void ApfpvStation::scanAll(int perChannelMs, bool includeDfs, const OnApFn& onAp
         // hiccup — catch per-channel so a single failure doesn't abort the app;
         // skip the bad channel and keep sweeping.
         try {
-            if (!inited) { rtl->Init(collector, sc); inited = true; }  // full bring-up + monitor RX
-            else         { rtl->SetMonitorChannel(sc); }               // fast retune (no PHY re-init)
+            if (!inited) { rtl->Init(collector, sc); inited = true; }     // bring-up + monitor RX
+            else { rm.set_channel_bwmode((uint8_t)ch, 0, CHANNEL_WIDTH_20); } // actually retunes
         } catch (...) { continue; }
         std::this_thread::sleep_for(std::chrono::milliseconds(perChannelMs));
     }
