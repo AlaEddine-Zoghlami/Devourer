@@ -58,7 +58,9 @@ public:
     // thread, and only while NOT connected (it drives the RX path). Requires
     // setDevice() to have been called.
     using OnApFn = std::function<void(const std::string&, const ApInfo&)>;
-    void scanAll(int perChannelMs, const OnApFn& onAp);
+    // includeDfs=false skips the DFS 5GHz channels (52-64, 100-144) — faster, and
+    // avoids tuning the radio onto radar-protected channels.
+    void scanAll(int perChannelMs, bool includeDfs, const OnApFn& onAp);
     State state() const { return _state.load(); }
     int   rssiDbm() const { return _rssi.load(); }
     // RX path calls this on every received data/beacon frame so the supervisor

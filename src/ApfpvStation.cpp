@@ -22,6 +22,12 @@
 #include "RadioManagementModule.h"
 #include <algorithm>
 #include <cstring>
+#ifdef __ANDROID__
+#include <android/log.h>
+#define SCANLOG(...) __android_log_print(ANDROID_LOG_INFO, "apfpv-scan", __VA_ARGS__)
+#else
+#define SCANLOG(...) ((void)0)
+#endif
 
 namespace apfpv {
 
@@ -212,29 +218,46 @@ void ApfpvStation::disconnect() {
 // and emit each NEW SSID. The RX collector runs on the device read thread; it
 // captures only `this`, and _onScanAp is cleared (and the processor swapped to a
 // no-op) before we return, so the still-running RX thread can't call a dead cb.
-void ApfpvStation::scanAll(int perChannelMs, const OnApFn& onAp) {
+static inline bool isDfsChannel(int ch) {
+    return (ch >= 52 && ch <= 64) || (ch >= 100 && ch <= 144);
+}
+
+void ApfpvStation::scanAll(int perChannelMs, bool includeDfs, const OnApFn& onAp) {
     if (!_rtl || !_rm) return;
     auto* rtl = reinterpret_cast<RtlJaguarDevice*>(_rtl);
-    auto& rm  = *reinterpret_cast<RadioManagementModule*>(_rm);
 
     { std::lock_guard<std::mutex> lk(_scanMtx); _scanSeen.clear(); _onScanAp = onAp; }
     set(State::Scanning);
 
-    auto collector = [this](const Packet& pkt) {
+    // Diagnostics: how many RX frames arrive, and how many parse as beacons.
+    std::atomic<int> pkts{0}, beacons{0};
+    auto collector = [this, &pkts, &beacons](const Packet& pkt) {
+        pkts.fetch_add(1);
         std::string ssid; ApInfo info;
         if (!ScanProbe::parseAnyBeacon(pkt.Data.data(), pkt.Data.size(), ssid, info)) return;
+        beacons.fetch_add(1);
         if (ssid.empty()) return;                       // skip hidden SSIDs
         info.rssi = (int)pkt.RxAtrib.rssi[0] - 110;     // approx dBm (gain byte)
         std::lock_guard<std::mutex> lk(_scanMtx);
         if (_onScanAp && _scanSeen.insert(ssid).second) _onScanAp(ssid, info);
     };
+    SCANLOG("scanAll begin (perCh=%d ms)", perChannelMs);
 
-    // hint first, then 5GHz UNII-1 (APFPV/EMAX), upper-5GHz UNII-3, then 2.4.
-    const int channels[] = { _params.channel, 36, 40, 44, 48,
-                             149, 153, 157, 161, 1, 6, 11 };
+    // hint first, then the full 5GHz set (UNII-1, UNII-2A/2C DFS, UNII-3) and all
+    // 2.4GHz channels — APs (incl. phone hotspots/home routers) can sit anywhere,
+    // e.g. DFS ch52-144. Passive RX-only listening on DFS is fine (no TX).
+    const int channels[] = {
+        _params.channel,
+        36, 40, 44, 48,                                              // UNII-1
+        52, 56, 60, 64,                                              // UNII-2A (DFS)
+        100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, // UNII-2C (DFS)
+        149, 153, 157, 161, 165,                                     // UNII-3
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13                    // 2.4GHz
+    };
     int last = 36; bool inited = false;
     for (int ch : channels) {
         if (ch <= 0) continue;
+        if (!includeDfs && isDfsChannel(ch)) continue;   // skip DFS when disabled
         last = ch;
         SelectedChannel sc{ .Channel=(uint8_t)ch, .ChannelOffset=0,
                             .ChannelWidth=CHANNEL_WIDTH_20 };
@@ -242,8 +265,8 @@ void ApfpvStation::scanAll(int perChannelMs, const OnApFn& onAp) {
         // hiccup — catch per-channel so a single failure doesn't abort the app;
         // skip the bad channel and keep sweeping.
         try {
-            if (!inited) { rtl->Init(collector, sc); inited = true; }  // starts RX
-            else         { rm.set_channel_bwmode((uint8_t)ch, 0, CHANNEL_WIDTH_20); }
+            if (!inited) { rtl->Init(collector, sc); inited = true; }  // full bring-up + monitor RX
+            else         { rtl->SetMonitorChannel(sc); }               // fast retune (no PHY re-init)
         } catch (...) { continue; }
         std::this_thread::sleep_for(std::chrono::milliseconds(perChannelMs));
     }
@@ -251,8 +274,11 @@ void ApfpvStation::scanAll(int perChannelMs, const OnApFn& onAp) {
     // Detach: no further emits, and replace the RX processor so the device's
     // read thread can't re-enter the collector after onAp's lifetime ends.
     { std::lock_guard<std::mutex> lk(_scanMtx); _onScanAp = nullptr; }
-    rtl->Init([](const Packet&){}, SelectedChannel{ .Channel=(uint8_t)last,
-              .ChannelOffset=0, .ChannelWidth=CHANNEL_WIDTH_20 });
+    SCANLOG("scanAll done: %d RX pkts, %d beacons, %zu SSIDs", pkts.load(), beacons.load(), _scanSeen.size());
+    try {
+        rtl->Init([](const Packet&){}, SelectedChannel{ .Channel=(uint8_t)last,
+                  .ChannelOffset=0, .ChannelWidth=CHANNEL_WIDTH_20 });
+    } catch (...) {}
     set(State::Idle);
 }
 
