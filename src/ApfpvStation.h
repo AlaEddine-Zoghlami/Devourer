@@ -95,5 +95,10 @@ private:
     std::mutex _scanMtx;
     std::set<std::string> _scanSeen;
     OnApFn _onScanAp;
+    // Diagnostics — MEMBERS (not scanAll locals): the RX collector is stored in
+    // the device and called from its read thread, so it must not capture
+    // stack-local counters by reference (that dangles -> SIGSEGV).
+    std::atomic<int> _scanPkts{0};
+    std::atomic<int> _scanBeacons{0};
 };
 }

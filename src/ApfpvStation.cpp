@@ -58,6 +58,18 @@ bool ApfpvStation::runConnectChain() {
     if (bad) { self.b[0]=0x02; self.b[1]=0x11; self.b[2]=0x22;
                self.b[3]=0x33; self.b[4]=0x44; self.b[5]=0x55; }
 
+    // Bring the PHY/RF up BEFORE any channel change. scanForSsid (and the arm
+    // path) call set_channel_bwmode -> phy_SwChnl8812, which dereferences null
+    // PHY state if the device was never Init'd -> SIGSEGV. Init once here with a
+    // no-op RX; the real RxDeframe RX is (re)wired after the handshake below.
+    if (_rtl) {
+        try {
+            reinterpret_cast<RtlJaguarDevice*>(_rtl)->Init([](const Packet&){},
+                SelectedChannel{ .Channel=(uint8_t)(_params.channel > 0 ? _params.channel : 40),
+                                 .ChannelOffset=0, .ChannelWidth=CHANNEL_WIDTH_20 });
+        } catch (...) {}
+    }
+
     // DISCOVERY: scan beacons for the SSID -> BSSID + channel + negotiated RSN.
     // Removes the hardcoded-channel / empty-BSSID / fixed-cipher assumptions
     // (security + discovery parity with the kernel wpa_supplicant the VRX uses).
@@ -229,13 +241,14 @@ void ApfpvStation::scanAll(int perChannelMs, bool includeDfs, const OnApFn& onAp
     { std::lock_guard<std::mutex> lk(_scanMtx); _scanSeen.clear(); _onScanAp = onAp; }
     set(State::Scanning);
 
-    // Diagnostics: how many RX frames arrive, and how many parse as beacons.
-    std::atomic<int> pkts{0}, beacons{0};
-    auto collector = [this, &pkts, &beacons](const Packet& pkt) {
-        pkts.fetch_add(1);
+    // Diagnostics in MEMBERS so the stored collector (called from the device RX
+    // thread) captures only `this` — capturing scanAll locals by ref dangles.
+    _scanPkts.store(0); _scanBeacons.store(0);
+    auto collector = [this](const Packet& pkt) {
+        _scanPkts.fetch_add(1);
         std::string ssid; ApInfo info;
         if (!ScanProbe::parseAnyBeacon(pkt.Data.data(), pkt.Data.size(), ssid, info)) return;
-        beacons.fetch_add(1);
+        _scanBeacons.fetch_add(1);
         if (ssid.empty()) return;                       // skip hidden SSIDs
         info.rssi = (int)pkt.RxAtrib.rssi[0] - 110;     // approx dBm (gain byte)
         std::lock_guard<std::mutex> lk(_scanMtx);
@@ -274,7 +287,7 @@ void ApfpvStation::scanAll(int perChannelMs, bool includeDfs, const OnApFn& onAp
     // Detach: no further emits, and replace the RX processor so the device's
     // read thread can't re-enter the collector after onAp's lifetime ends.
     { std::lock_guard<std::mutex> lk(_scanMtx); _onScanAp = nullptr; }
-    SCANLOG("scanAll done: %d RX pkts, %d beacons, %zu SSIDs", pkts.load(), beacons.load(), _scanSeen.size());
+    SCANLOG("scanAll done: %d RX pkts, %d beacons, %zu SSIDs", _scanPkts.load(), _scanBeacons.load(), _scanSeen.size());
     try {
         rtl->Init([](const Packet&){}, SelectedChannel{ .Channel=(uint8_t)last,
                   .ChannelOffset=0, .ChannelWidth=CHANNEL_WIDTH_20 });
