@@ -56,7 +56,44 @@ void ApfpvStation::set(State s) { _state.store(s); if (_onState) _onState(s); }
 ApfpvStation::ApfpvStation(void* dev, void* rm, OnRtpFn onRtp, OnStateFn onState)
     : _dev(dev), _rm(rm), _onRtp(std::move(onRtp)), _onState(std::move(onState)) {}
 
-ApfpvStation::~ApfpvStation() { disconnect(); }
+ApfpvStation::~ApfpvStation() { stopBeaconCal(); disconnect(); }
+
+// VRX EIRP-calibration beacon: inject an open beacon periodically so a second
+// phone can scan + measure the dongle's EIRP. Not a station while beaconing.
+void ApfpvStation::startBeaconCal(const std::string& ssid, int channel, int txIndex) {
+    stopBeaconCal();
+    disconnect();                       // can't be a station and beacon at once
+    if (!_rtl || !_dev) return;
+    auto* rtl = reinterpret_cast<RtlJaguarDevice*>(_rtl);
+    auto* dev = reinterpret_cast<RtlUsbAdapter*>(_dev);
+    try {
+        rtl->Init([](const Packet&){}, legalApfpvChannel(channel, 20));   // tune + bring up
+        rtl->SetTxPower((uint8_t)std::max(0, std::min(63, txIndex)));
+    } catch (...) { return; }
+    // our MAC (REG_MACID); synthesize a locally-administered one if unprogrammed
+    Mac self{};
+    for (int i = 0; i < 6; ++i) self[i] = dev->rtw_read8(0x0610 + i);
+    bool bad = true; for (int i = 0; i < 6; ++i) if (self[i] != 0 && self[i] != 0xFF) bad = false;
+    if (bad) { const uint8_t m[6] = {0x02,0x11,0x22,0x33,0x44,0x55};
+               for (int i = 0; i < 6; ++i) self[i] = m[i]; }
+    auto mpdu = BuildBeacon(self, ssid, (uint8_t)channel);
+    _beaconRun.store(true);
+    _beaconThread = std::thread([this, dev, mpdu]() {
+        std::vector<uint8_t> frame(40 + mpdu.size(), 0);   // 40 = 8812 TX desc
+        std::memcpy(frame.data() + 40, mpdu.data(), mpdu.size());
+        FillStationTxDesc(frame.data(), (uint16_t)mpdu.size(), 40,
+                          0, StationFrameKind::Mgmt, 0, 0x04);
+        while (_beaconRun.load()) {
+            try { dev->send_packet(frame.data(), frame.size()); } catch (...) {}
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));   // ~10 beacons/s
+        }
+    });
+}
+
+void ApfpvStation::stopBeaconCal() {
+    _beaconRun.store(false);
+    if (_beaconThread.joinable()) _beaconThread.join();
+}
 
 // The gated establishment chain (arm -> auth -> assoc -> WPA2 -> DHCP -> stream).
 // Returns true only on a held, streaming link. Used for both initial connect

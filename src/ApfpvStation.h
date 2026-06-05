@@ -61,6 +61,14 @@ public:
     // includeDfs=false skips the DFS 5GHz channels (52-64, 100-144) — faster, and
     // avoids tuning the radio onto radar-protected channels.
     void scanAll(int perChannelMs, bool includeDfs, const OnApFn& onAp);
+
+    // VRX EIRP-calibration beacon: inject an open beacon with `ssid` on `channel`
+    // at TX power index `txIndex`, so a second phone's Wi-Fi scan can read the
+    // dongle's RSSI and estimate its EIRP. Stops any station/supervisor first.
+    // Runs on its own thread; call stopBeaconCal() (or destruct) to end it.
+    void startBeaconCal(const std::string& ssid, int channel, int txIndex);
+    void stopBeaconCal();
+
     State state() const { return _state.load(); }
     int   rssiDbm() const { return _rssi.load(); }
     // RX path calls this on every received data/beacon frame so the supervisor
@@ -100,5 +108,8 @@ private:
     // stack-local counters by reference (that dangles -> SIGSEGV).
     std::atomic<int> _scanPkts{0};
     std::atomic<int> _scanBeacons{0};
+    // VRX EIRP-calibration beacon injector
+    std::atomic<bool> _beaconRun{false};
+    std::thread _beaconThread;
 };
 }

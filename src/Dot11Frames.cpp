@@ -30,6 +30,7 @@ using Mac = std::array<uint8_t,6>;
 static constexpr uint16_t FC_MGMT          = 0x0000;
 static constexpr uint16_t FC_SUB_ASSOC_REQ = 0x0000;  // mgmt subtype 0
 static constexpr uint16_t FC_SUB_AUTH      = 0x00B0;   // mgmt subtype 11 (<<4)
+static constexpr uint16_t FC_SUB_BEACON    = 0x0080;   // mgmt subtype 8  (<<4)
 static constexpr uint16_t FC_DATA          = 0x0008;   // type data
 static constexpr uint16_t FC_TODS          = 0x0100;   // to-DS (station->AP)
 
@@ -54,6 +55,29 @@ std::vector<uint8_t> BuildAuthOpenSeq1(const Mac& self, const Mac& bssid) {
     put_le16(f, 0);   // auth algorithm = Open System
     put_le16(f, 1);   // auth sequence  = 1
     put_le16(f, 0);   // status code    = 0
+    return f;
+}
+
+// ---- Beacon (open, for the VRX EIRP-calibration mode) ----------------------
+//   Broadcast beacon so a phone Wi-Fi scan lists the dongle as an AP and can read
+//   its RSSI (-> EIRP). Open network (no privacy bit): we never associate, this is
+//   a measurement target only.
+std::vector<uint8_t> BuildBeacon(const Mac& self, const std::string& ssid, uint8_t channel) {
+    std::vector<uint8_t> f;
+    static const Mac bcast = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    put_hdr(f, FC_MGMT | FC_SUB_BEACON, bcast, self, self);   // addr3=BSSID=self
+    for (int i = 0; i < 8; ++i) f.push_back(0);   // timestamp (driver/HW may fill)
+    put_le16(f, 100);        // beacon interval (100 TU ~= 102.4 ms)
+    put_le16(f, 0x0001);     // capability info: ESS, open (no privacy)
+    // IE: SSID (0)
+    f.push_back(0x00); f.push_back((uint8_t)ssid.size());
+    f.insert(f.end(), ssid.begin(), ssid.end());
+    // IE: Supported Rates (1)
+    static const uint8_t rates[] = {0x82,0x84,0x8b,0x96,0x0c,0x12,0x18,0x24};
+    f.push_back(0x01); f.push_back(sizeof(rates));
+    f.insert(f.end(), rates, rates+sizeof(rates));
+    // IE: DS Param (3) = current channel (so the scanner reports the right channel)
+    f.push_back(0x03); f.push_back(0x01); f.push_back(channel);
     return f;
 }
 
