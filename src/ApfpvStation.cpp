@@ -185,7 +185,14 @@ void ApfpvStation::supervisorLoop() {
             set(State::Reconnecting);
             std::this_thread::sleep_for(milliseconds(backoff));
             if (!_run.load()) break;
-            bool ok = runConnectChain();            // re-arm on known channel
+            // A USB register read/write can throw (rtw_read -> ios_base::failure)
+            // if the dongle hiccups or is accessed concurrently. Catch it here so
+            // the supervisor THREAD degrades to a failed attempt instead of
+            // terminating the whole app (std::terminate -> SIGABRT).
+            bool ok = false;
+            try { ok = runConnectChain(); }          // re-arm on known channel
+            catch (const std::exception&) { ok = false; set(State::FailNoAp); }
+            catch (...)                    { ok = false; set(State::FailNoAp); }
             if (!ok) {
                 backoff = std::min(backoff * 2, _params.maxBackoffMs);  // exp backoff
             } else {
@@ -231,8 +238,13 @@ void ApfpvStation::scanAll(int perChannelMs, const OnApFn& onAp) {
         last = ch;
         SelectedChannel sc{ .Channel=(uint8_t)ch, .ChannelOffset=0,
                             .ChannelWidth=CHANNEL_WIDTH_20 };
-        if (!inited) { rtl->Init(collector, sc); inited = true; }  // starts RX
-        else         { rm.set_channel_bwmode((uint8_t)ch, 0, CHANNEL_WIDTH_20); }
+        // Tuning is a USB register op (rtw_read/write) that can throw on a dongle
+        // hiccup — catch per-channel so a single failure doesn't abort the app;
+        // skip the bad channel and keep sweeping.
+        try {
+            if (!inited) { rtl->Init(collector, sc); inited = true; }  // starts RX
+            else         { rm.set_channel_bwmode((uint8_t)ch, 0, CHANNEL_WIDTH_20); }
+        } catch (...) { continue; }
         std::this_thread::sleep_for(std::chrono::milliseconds(perChannelMs));
     }
 
