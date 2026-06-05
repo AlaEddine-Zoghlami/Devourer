@@ -31,6 +31,26 @@
 
 namespace apfpv {
 
+// Map a primary channel + desired bandwidth (MHz) to a SelectedChannel kept
+// INSIDE the legal DE APFPV band 5170-5250 MHz (5.2 GHz UNII-1; 200 mW @ 20 MHz
+// under the 10 mW/MHz PSD cap). For 40 MHz we pick the HT40 secondary side that
+// never crosses 5170/5250 — primary 36/44 extend ABOVE (offset LOWER = primary
+// is the lower 20 MHz), primary 40/48 extend BELOW (offset UPPER); both land on
+// centres 38 (5170-5210) or 46 (5210-5250). 20 MHz is pass-through; 80 MHz
+// centres on 42 and fills the band exactly. NB: WFB's 5.8 GHz / 25 mW band is a
+// separate code path and is unaffected by this helper.
+static SelectedChannel legalApfpvChannel(int ch, int bwMHz) {
+    uint8_t c = (uint8_t)(ch > 0 ? ch : 40);
+    if (bwMHz >= 80)
+        return SelectedChannel{ c, (uint8_t)HAL_PRIME_CHNL_OFFSET_DONT_CARE, CHANNEL_WIDTH_80 };
+    if (bwMHz == 40) {
+        uint8_t off = (c == 36 || c == 44) ? (uint8_t)HAL_PRIME_CHNL_OFFSET_LOWER
+                                           : (uint8_t)HAL_PRIME_CHNL_OFFSET_UPPER;
+        return SelectedChannel{ c, off, CHANNEL_WIDTH_40 };
+    }
+    return SelectedChannel{ c, (uint8_t)HAL_PRIME_CHNL_OFFSET_DONT_CARE, CHANNEL_WIDTH_20 };
+}
+
 void ApfpvStation::set(State s) { _state.store(s); if (_onState) _onState(s); }
 
 ApfpvStation::ApfpvStation(void* dev, void* rm, OnRtpFn onRtp, OnStateFn onState)
@@ -141,9 +161,10 @@ bool ApfpvStation::runConnectChain() {
     if (_rtl) {
         auto* rtl = reinterpret_cast<RtlJaguarDevice*>(_rtl);
         RxDeframe* rx = _rx.get();
+        // Stream at the configured bandwidth, on a channel/offset guaranteed legal
+        // for DE APFPV (5170-5250). 20 MHz (the default) is unchanged.
         rtl->Init([rx](const Packet& pkt){ rx->onPacket(pkt); },
-                  SelectedChannel{ .Channel=(uint8_t)_params.channel, .ChannelOffset=0,
-                                   .ChannelWidth=CHANNEL_WIDTH_20 });
+                  legalApfpvChannel(_params.channel, _params.bandwidth));
     }
 
     // Wait (bounded) for the 4-way handshake to install keys.
