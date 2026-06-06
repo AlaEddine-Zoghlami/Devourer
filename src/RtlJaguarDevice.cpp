@@ -173,7 +173,15 @@ bool RtlJaguarDevice::send_packet(const uint8_t *packet, size_t length) {
       _eepromManager->version_id.ICType == CHIP_8814A &&
       !std::getenv("DEVOURER_TX_LEGACY_8812_DESC");
 
-  /* Single-fragment frame: LAST_SEG=1 (no FIRST_SEG). */
+  /* Single-fragment frame: BOTH FIRST_SEG=1 AND LAST_SEG=1. The previous code
+   * set only LAST_SEG, leaving FIRST_SEG=0 -> the chip's TX DMA treats the frame
+   * as a non-first continuation segment that never completes, so the bulk-OUT
+   * succeeds at the USB layer but the frame never leaves the TX FIFO = on-air
+   * silence (issue #50). Confirmed by usbmon diff: the kernel 88XXau driver sets
+   * dword0 byte3 = 0x8d (FIRST_SEG|LAST_SEG|BMC|OWN); devourer was 0x85 (FIRST_SEG
+   * cleared). This is a descriptor-data field, not a control write -- which is why
+   * replaying the kernel's vendor control writes never fixed it. */
+  SET_TX_DESC_FIRST_SEG_8812(usb_frame, 1);
   SET_TX_DESC_LAST_SEG_8812(usb_frame, 1);
   if (!is_8814a) {
     /* OWN=1 needed on 8812/8821 so chip processes the descriptor. On
