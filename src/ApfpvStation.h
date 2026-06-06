@@ -37,6 +37,11 @@ public:
                     // beacons (security+discovery parity with wpa_supplicant);
                     // channel above is the starting hint / fallback.
                     bool scan=true;
+                    // PHONE-ASSISTED connect: the phone's own Wi-Fi already knows
+                    // the AP's channel + BSSID, so we can SKIP the dongle's slow,
+                    // flaky beacon sweep and arm straight to this BSSID on `channel`.
+                    std::array<uint8_t,6> bssid{};
+                    bool haveBssid=false;
                     // reconnect tuning — matched to wpa_supplicant defaults the
                     // VRX relies on: immediate re-associate, ~5s scan interval.
                     bool autoReconnect=true;
@@ -97,6 +102,12 @@ private:
     std::atomic<bool> _deauth{false};
     std::atomic<bool> _run{false};   // supervisor running
     std::thread _supervisor;
+    // RX runs on its OWN thread (RtlJaguarDevice::Init is a blocking read loop).
+    // A single dispatch routes by phase: 0 = discovery/arm (StationMode), 1 =
+    // streaming (RxDeframe). _rxReady flips true once the loop is live.
+    std::thread _rxThread;
+    std::atomic<int>  _rxPhase{0};
+    std::atomic<bool> _rxReady{false};
     // scanAll() state — the RX collector runs on the device thread, so access is
     // mutex-guarded and _onScanAp is cleared before scanAll returns so the still-
     // running RX thread can never call into a destroyed callback.

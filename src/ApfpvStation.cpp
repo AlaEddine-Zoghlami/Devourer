@@ -125,42 +125,65 @@ bool ApfpvStation::runConnectChain() {
     // no-op processor, so _scanResult and _gotAuthResp were never set -> the link
     // always failed at discovery. The real RxDeframe RX is wired after handshake.
     { std::lock_guard<std::mutex> lk(_scanMtx); _scanSeen.clear(); }   // diag: SSIDs heard
+    // Run the device RX loop on its OWN thread. RtlJaguarDevice::Init is a BLOCKING
+    // infinite read loop ("Listening air..."); calling it inline froze the connect
+    // on the hint channel so scanForSsid never hopped (it only ever heard ch40).
+    // The connect thread now drives channel hops + arm while this thread feeds RX.
+    // One dispatch routes by phase: discovery/arm -> StationMode; streaming -> RxDeframe.
     if (_rtl) {
+        auto* rtl = reinterpret_cast<RtlJaguarDevice*>(_rtl);
         StationMode* sp = &sta;
-        try {
-            reinterpret_cast<RtlJaguarDevice*>(_rtl)->Init(
-                [sp, this](const Packet& pkt){
-                    const uint8_t* f = pkt.Data.data(); size_t n = pkt.Data.size();
-                    if (n < 24) return;
-                    uint16_t fc = (uint16_t)(f[0] | (f[1] << 8));
-                    sp->onScanFrame(f, n);              // beacons -> _scanResult
-                    // DIAG: log each unique SSID the dongle hears during discovery,
-                    // so we can see whether the target beacon is reaching the RX.
-                    std::string ss; ApInfo bi;
-                    if (ScanProbe::parseAnyBeacon(f, n, ss, bi) && !ss.empty()) {
-                        std::lock_guard<std::mutex> lk(_scanMtx);
-                        if (_scanSeen.insert(ss).second)
-                            SCANLOG("discovery heard \"%s\" ch%d", ss.c_str(), bi.channel);
-                    }
-                    MacAddr a1{}, a2{};
-                    std::memcpy(a1.b.data(), f + 4,  6);
-                    std::memcpy(a2.b.data(), f + 10, 6);
-                    sp->onMgmtFrame(fc, a1, a2);        // auth/assoc/deauth -> flags
-                },
-                SelectedChannel{ .Channel=(uint8_t)(_params.channel > 0 ? _params.channel : 40),
-                                 .ChannelOffset=0, .ChannelWidth=CHANNEL_WIDTH_20 });
-        } catch (...) {}
+        auto dispatch = [sp, this](const Packet& pkt){
+            _rxReady.store(true);
+            if (_rxPhase.load() == 1) { RxDeframe* rx = _rx.get(); if (rx) rx->onPacket(pkt); return; }
+            const uint8_t* f = pkt.Data.data(); size_t n = pkt.Data.size();
+            if (n < 24) return;
+            uint16_t fc = (uint16_t)(f[0] | (f[1] << 8));
+            sp->onScanFrame(f, n);                  // beacons -> _scanResult
+            std::string ss; ApInfo bi;
+            if (ScanProbe::parseAnyBeacon(f, n, ss, bi) && !ss.empty()) {
+                std::lock_guard<std::mutex> lk(_scanMtx);
+                if (_scanSeen.insert(ss).second)
+                    SCANLOG("discovery heard \"%s\" ch%d", ss.c_str(), bi.channel);
+            }
+            MacAddr a1{}, a2{};
+            std::memcpy(a1.b.data(), f + 4,  6);
+            std::memcpy(a2.b.data(), f + 10, 6);
+            sp->onMgmtFrame(fc, a1, a2);            // auth/assoc/deauth -> flags
+        };
+        // stop any prior RX thread, then start a fresh one on the init channel
+        rtl->should_stop = true;
+        if (_rxThread.joinable()) _rxThread.join();
+        rtl->should_stop = false;
+        _rxPhase.store(0); _rxReady.store(false);
+        uint8_t initCh = (uint8_t)(_params.channel > 0 ? _params.channel : 40);
+        _rxThread = std::thread([rtl, dispatch, initCh]() {
+            try { rtl->Init(dispatch, SelectedChannel{ .Channel=initCh, .ChannelOffset=0,
+                                                       .ChannelWidth=CHANNEL_WIDTH_20 }); }
+            catch (...) {}
+        });
+        // wait until the RX loop is live (device brought up) or a short timeout
+        using namespace std::chrono;
+        auto t0 = steady_clock::now();
+        while (!_rxReady.load() && steady_clock::now() - t0 < seconds(4))
+            std::this_thread::sleep_for(milliseconds(50));
     }
 
     // DISCOVERY: scan beacons for the SSID -> BSSID + channel + negotiated RSN.
     // Removes the hardcoded-channel / empty-BSSID / fixed-cipher assumptions
     // (security + discovery parity with the kernel wpa_supplicant the VRX uses).
     ApInfo ap;
-    if (_params.scan) {
+    if (_params.haveBssid) {
+        // PHONE-ASSISTED: the phone already resolved the AP's BSSID + channel, so
+        // skip the dongle sweep entirely and arm straight to it (CCMP/PSK default).
+        for (int i = 0; i < 6; ++i) bssid.b[i] = _params.bssid[i];
+        sta.setNegotiatedCipher(0x000FAC04, 0x000FAC04);
+        SCANLOG("phone-assisted: BSSID %02x:%02x:%02x:%02x:%02x:%02x ch%d — skipping sweep",
+                bssid.b[0],bssid.b[1],bssid.b[2],bssid.b[3],bssid.b[4],bssid.b[5], _params.channel);
+    } else if (_params.scan) {
         set(State::Scanning);
-        // StationMode collects beacons via onMgmtFrame->ScanProbe; we ask it to
-        // sweep the channel hint first, then the 5GHz UNII-1 set (36..48) the
-        // EMAX VTX uses. Found AP fixes channel + cipher for association.
+        // Sweep beacons for the SSID -> BSSID + channel + negotiated RSN (now works:
+        // the RX thread feeds frames while this thread hops channels).
         ap = sta.scanForSsid(_params.ssid.c_str(), _params.channel, /*ms*/2000);
         if (!ap.found) { set(State::FailNoAp); return false; }
         bssid.b = ap.bssid;
@@ -207,14 +230,10 @@ bool ApfpvStation::runConnectChain() {
     _rx->setStation(this);
     { ApfpvDhcp* dh = _dhcp.get();
       _rx->setDhcpSink([dh](const uint8_t* b, size_t n){ dh->onBootpReply(b, n); }); }
-    if (_rtl) {
-        auto* rtl = reinterpret_cast<RtlJaguarDevice*>(_rtl);
-        RxDeframe* rx = _rx.get();
-        // Stream at the configured bandwidth, on a channel/offset guaranteed legal
-        // for DE APFPV (5170-5250). 20 MHz (the default) is unchanged.
-        rtl->Init([rx](const Packet& pkt){ rx->onPacket(pkt); },
-                  legalApfpvChannel(_params.channel, _params.bandwidth));
-    }
+    // Switch the ALREADY-RUNNING RX thread to the streaming path — do NOT re-Init
+    // (that blocks). EAPOL (handshake), DHCP replies, and RTP now route through
+    // RxDeframe via the dispatch. The device is already tuned to the AP's channel.
+    _rxPhase.store(1);
 
     // Wait (bounded) for the 4-way handshake to install keys.
     {
@@ -306,6 +325,9 @@ void ApfpvStation::supervisorLoop() {
 void ApfpvStation::disconnect() {
     _run.store(false);
     if (_supervisor.joinable()) _supervisor.join();
+    // Stop the RX read loop and join its thread.
+    if (_rtl) reinterpret_cast<RtlJaguarDevice*>(_rtl)->should_stop = true;
+    if (_rxThread.joinable()) _rxThread.join();
     set(State::Idle);
 }
 
