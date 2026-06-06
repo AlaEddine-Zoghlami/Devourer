@@ -51,7 +51,13 @@ static SelectedChannel legalApfpvChannel(int ch, int bwMHz) {
     return SelectedChannel{ c, (uint8_t)HAL_PRIME_CHNL_OFFSET_DONT_CARE, CHANNEL_WIDTH_20 };
 }
 
-void ApfpvStation::set(State s) { _state.store(s); if (_onState) _onState(s); }
+void ApfpvStation::set(State s) {
+    _state.store(s);
+    // 0Idle 1Scan 2Arm 3Auth 4Assoc 5Handshake 6Dhcp 7Stream 8FailNoAp 9FailTx
+    // 10FailNoAck 11FailAuth 12FailDhcp 13LinkLost 14Reconnecting
+    SCANLOG("apfpv state -> %d", (int)s);
+    if (_onState) _onState(s);
+}
 
 ApfpvStation::ApfpvStation(void* dev, void* rm, OnRtpFn onRtp, OnStateFn onState)
     : _dev(dev), _rm(rm), _onRtp(std::move(onRtp)), _onState(std::move(onState)) {}
@@ -185,6 +191,7 @@ bool ApfpvStation::runConnectChain() {
         // Sweep beacons for the SSID -> BSSID + channel + negotiated RSN (now works:
         // the RX thread feeds frames while this thread hops channels).
         ap = sta.scanForSsid(_params.ssid.c_str(), _params.channel, /*ms*/2000);
+        SCANLOG("scan: \"%s\" found=%d ch=%d", _params.ssid.c_str(), ap.found?1:0, ap.channel);
         if (!ap.found) { set(State::FailNoAp); return false; }
         bssid.b = ap.bssid;
         _params.channel = ap.channel ? ap.channel : _params.channel;
@@ -194,6 +201,7 @@ bool ApfpvStation::runConnectChain() {
 
     set(State::Arming);
     auto r = sta.runProbe(self, bssid, _params.ssid.c_str(), /*hold*/3);
+    SCANLOG("arm result: %d (0=GO 1=Deauth 2=NoAssocResp 3=TXFAIL_NoAuth 4=Error)", (int)r);
     switch (r) {
         case StationMode::Result::TXFAIL_NoAuthResp: set(State::FailTx);   return false;
         case StationMode::Result::NOGO_Deauthed:     set(State::FailNoAck); return false;
