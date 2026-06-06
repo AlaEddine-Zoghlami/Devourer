@@ -111,6 +111,13 @@ bool ApfpvStation::runConnectChain() {
     auto& dev = *reinterpret_cast<RtlUsbAdapter*>(_dev);
     auto& rm  = *reinterpret_cast<RadioManagementModule*>(_rm);
     auto sendFrame = [&dev](const std::vector<uint8_t>& f) {
+        // Async-IO model (default): async TX completes via the SAME libusb event
+        // loop that drives the async RX URBs (kernel 88XXau model) -> RX and TX
+        // no longer fight over the event handler, so the auth/assoc actually
+        // radiates. Legacy DEVOURER_SYNC_IO uses a synchronous bulk-OUT (the async
+        // TX cannot complete without an event loop in that mode).
+        if (std::getenv("DEVOURER_SYNC_IO"))
+            return dev.bulk_send_sync(const_cast<uint8_t*>(f.data()), f.size(), 200) == 0;
         return dev.send_packet(const_cast<uint8_t*>(f.data()), f.size());
     };
     StationMode sta(dev, rm, sendFrame);
@@ -151,17 +158,26 @@ bool ApfpvStation::runConnectChain() {
             std::memcpy(a2.b.data(), f + 10, 6);
             sp->onMgmtFrame(fc, a1, a2);            // auth/assoc/deauth -> flags
         };
-        // stop any prior RX thread, then start a fresh one on the init channel
-        rtl->should_stop = true;
-        if (_rxThread.joinable()) _rxThread.join();
-        rtl->should_stop = false;
         _rxPhase.store(0); _rxReady.store(false);
         uint8_t initCh = (uint8_t)(_params.channel > 0 ? _params.channel : 40);
-        _rxThread = std::thread([rtl, dispatch, initCh]() {
-            try { rtl->Init(dispatch, SelectedChannel{ .Channel=initCh, .ChannelOffset=0,
-                                                       .ChannelWidth=CHANNEL_WIDTH_20 }); }
-            catch (...) {}
-        });
+        SelectedChannel initSel{ .Channel=initCh, .ChannelOffset=0, .ChannelWidth=CHANNEL_WIDTH_20 };
+        if (std::getenv("DEVOURER_SYNC_IO")) {
+            // LEGACY blocking sync RX loop (monopolises libusb -> async TX can't
+            // run; kept only for A/B). Spawn on its own thread.
+            rtl->should_stop = true;
+            if (_rxThread.joinable()) _rxThread.join();
+            rtl->should_stop = false;
+            _rxThread = std::thread([rtl, dispatch, initSel]() {
+                try { rtl->Init(dispatch, initSel); } catch (...) {}
+            });
+        } else {
+            // KERNEL-STYLE async RX: N bulk-IN URBs kept in flight, delivered from
+            // the caller's libusb_handle_events loop. No blocking read, so the
+            // async TX (send_packet) completes -> station auth/assoc actually
+            // radiates. Restart cleanly on each (re)connect.
+            rtl->StopAsyncRx();
+            try { rtl->StartMonitorAsyncRx(dispatch, initSel); } catch (...) {}
+        }
         // wait until the RX loop is live (device brought up) or a short timeout
         using namespace std::chrono;
         auto t0 = steady_clock::now();
@@ -344,8 +360,11 @@ void ApfpvStation::supervisorLoop() {
 void ApfpvStation::disconnect() {
     _run.store(false);
     if (_supervisor.joinable()) _supervisor.join();
-    // Stop the RX read loop and join its thread.
-    if (_rtl) reinterpret_cast<RtlJaguarDevice*>(_rtl)->should_stop = true;
+    // Stop the RX: async URB pool (default) + legacy sync read thread.
+    if (_rtl) {
+        reinterpret_cast<RtlJaguarDevice*>(_rtl)->should_stop = true;
+        reinterpret_cast<RtlJaguarDevice*>(_rtl)->StopAsyncRx();
+    }
     if (_rxThread.joinable()) _rxThread.join();
     set(State::Idle);
 }

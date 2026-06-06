@@ -112,8 +112,20 @@ std::vector<Packet> RtlUsbAdapter::infinite_read() {
   int actual_length = 0;
   int rc;
 
-  rc = libusb_bulk_transfer(_dev_handle, _bulk_in_ep, buffer, sizeof(buffer),
-                            &actual_length, USB_TIMEOUT * 10);
+  /* RX read timeout. A long timeout makes the sync RX monopolise libusb's event
+   * handler, so a concurrent TX (auth/assoc) cannot run and times out -> station
+   * mode never transmits. A short RX timeout lets RX and TX interleave.
+   * DEVOURER_RX_TIMEOUT (ms) overrides; default kept long for the RX-only paths. */
+  int rx_timeout = USB_TIMEOUT * 10;
+  if (const char *e = std::getenv("DEVOURER_RX_TIMEOUT")) rx_timeout = std::atoi(e);
+  // Yield the bus the instant a TX is pending, then hold it only for this read.
+  while (_txWaiting->load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  {
+    std::lock_guard<std::mutex> lk(*_busMtx);
+    rc = libusb_bulk_transfer(_dev_handle, _bulk_in_ep, buffer, sizeof(buffer),
+                              &actual_length, rx_timeout);
+  }
+  if (rc == LIBUSB_ERROR_TIMEOUT) { return {}; }   // no data this window — normal
 
   if (rc < 0) {
     /* Rate-limit the error log: a fast-failing rc (e.g. LIBUSB_ERROR_NO_DEVICE
@@ -538,9 +550,12 @@ int RtlUsbAdapter::bulk_send_sync_ep(uint8_t ep, uint8_t *packet, size_t length,
    * OUT is preceded by 0 CLEAR_FEATUREs; later CLEAR_FEATUREs happen during
    * normal TX-queue operation, not the per-send hot path. Resetting the
    * data toggle bit corrupts the chip's state machine. */
+  _txWaiting->store(true);                    // make the RX loop yield the bus
+  std::unique_lock<std::mutex> lk(*_busMtx);  // exclusive bus for this TX
   int actual = 0;
   int rc = libusb_bulk_transfer(_dev_handle, ep, packet,
                                 static_cast<int>(length), &actual, timeout_ms);
+  _txWaiting->store(false);
   if (rc != LIBUSB_SUCCESS) {
     _logger->error("bulk_send EP {} FAIL rc={} got {}/{}", (int)ep, rc,
                    actual, (int)length);
@@ -548,6 +563,66 @@ int RtlUsbAdapter::bulk_send_sync_ep(uint8_t ep, uint8_t *packet, size_t length,
   }
   _logger->info("bulk_send EP {} OK {} bytes", (int)ep, actual);
   return actual;
+}
+
+// ---- Kernel-style async RX (APFPV station path) ---------------------------
+struct RtlUsbAdapter::AsyncRxState {
+  Logger_t logger;
+  std::function<void(const Packet &)> proc;
+  std::atomic<bool> running{true};
+  std::atomic<int> inflight{0};
+  std::vector<libusb_transfer *> transfers;
+  std::vector<std::vector<uint8_t>> buffers;
+};
+
+static void LIBUSB_CALL apfpv_async_rx_cb(libusb_transfer *xfer) {
+  auto *st = static_cast<RtlUsbAdapter::AsyncRxState *>(xfer->user_data);
+  if (xfer->status == LIBUSB_TRANSFER_COMPLETED && xfer->actual_length > 0) {
+    try {
+      FrameParser fp{st->logger};
+      auto pkts = fp.recvbuf2recvframe(
+          std::span<uint8_t>{xfer->buffer, (size_t)xfer->actual_length});
+      for (auto &p : pkts) st->proc(p);
+    } catch (...) {}
+  }
+  bool fatal = (xfer->status == LIBUSB_TRANSFER_CANCELLED ||
+                xfer->status == LIBUSB_TRANSFER_NO_DEVICE);
+  if (st->running.load() && !fatal && libusb_submit_transfer(xfer) == 0)
+    return;                       // re-queued, still in flight
+  st->inflight.fetch_sub(1);      // retired this URB
+}
+
+void RtlUsbAdapter::startAsyncRx(std::function<void(const Packet &)> processor,
+                                 int numUrbs) {
+  stopAsyncRx();
+  auto st = std::make_shared<AsyncRxState>();
+  st->logger = _logger;
+  st->proc = std::move(processor);
+  st->running.store(true);
+  st->buffers.resize(numUrbs);
+  st->transfers.reserve(numUrbs);
+  for (int i = 0; i < numUrbs; ++i) {
+    st->buffers[i].resize(16 * 1024);
+    libusb_transfer *t = libusb_alloc_transfer(0);
+    libusb_fill_bulk_transfer(t, _dev_handle, _bulk_in_ep, st->buffers[i].data(),
+                              (int)st->buffers[i].size(), apfpv_async_rx_cb,
+                              st.get(), 0 /* no timeout */);
+    st->transfers.push_back(t);
+    if (libusb_submit_transfer(t) == 0) st->inflight.fetch_add(1);
+  }
+  _asyncRx = st;
+  _logger->info("async RX: {} URBs in flight", st->inflight.load());
+}
+
+void RtlUsbAdapter::stopAsyncRx() {
+  auto st = _asyncRx;
+  if (!st) return;
+  st->running.store(false);
+  for (auto *t : st->transfers) libusb_cancel_transfer(t);
+  for (int i = 0; i < 200 && st->inflight.load() > 0; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  for (auto *t : st->transfers) libusb_free_transfer(t);
+  _asyncRx.reset();
 }
 
 void RtlUsbAdapter::phy_set_bb_reg(uint16_t regAddr, uint32_t bitMask,

@@ -298,6 +298,20 @@ void RtlJaguarDevice::SetMonitorChannel(SelectedChannel channel) {
                                        channel.ChannelWidth);
 }
 
+void RtlJaguarDevice::StartMonitorAsyncRx(Action_ParsedRadioPacket processor,
+                                          SelectedChannel channel) {
+  _packetProcessor = processor;
+  StartWithMonitorMode(channel);
+  SetMonitorChannel(channel);
+  int nUrbs = 8;
+  if (const char *e = std::getenv("DEVOURER_RX_URBS")) nUrbs = std::atoi(e);
+  _device.startAsyncRx(
+      [this](const Packet &p) { if (_packetProcessor) _packetProcessor(p); }, nUrbs);
+  _logger->info("APFPV async RX listening (no blocking read loop)");
+}
+
+void RtlJaguarDevice::StopAsyncRx() { _device.stopAsyncRx(); }
+
 void RtlJaguarDevice::StartWithMonitorMode(SelectedChannel selectedChannel) {
   if (NetDevOpen(selectedChannel) == false) {
     throw std::ios_base::failure("StartWithMonitorMode failed NetDevOpen");

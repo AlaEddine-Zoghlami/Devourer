@@ -43,6 +43,12 @@ public:
   RadioManagementModule& radioManager() { return *_radioManagement; }
   void SetMonitorChannel(SelectedChannel channel);
   void InitWrite(SelectedChannel channel);
+  // Kernel-style async RX: bring the PHY up in monitor mode, then keep N bulk-IN
+  // URBs in flight delivering to `processor` (driven by the caller's
+  // libusb_handle_events loop). Returns immediately — NO blocking read loop, so
+  // a concurrent async TX can run. Used by the APFPV station path.
+  void StartMonitorAsyncRx(Action_ParsedRadioPacket processor, SelectedChannel channel);
+  void StopAsyncRx();
   void SetTxPower(uint8_t power);
   uint8_t GetTxPower();
   bool send_packet(const uint8_t* packet, size_t length);

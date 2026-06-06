@@ -93,6 +93,8 @@ add_library(WiFiDriver
     src/RxDeframe.h
     src/ApfpvStation.cpp
     src/ApfpvStation.h
+    src/ScanProbe.cpp
+    src/ScanProbe.h
     src/crypto/Sha1Hmac.cpp
     src/crypto/Sha1Hmac.h
     src/crypto/AesCcm.cpp

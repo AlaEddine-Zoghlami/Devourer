@@ -6,6 +6,10 @@
 #include <libusb.h>
 #include <thread>
 #include <vector>
+#include <mutex>
+#include <atomic>
+#include <memory>
+#include <functional>
 
 #include "FrameParser.h"
 #include "drv_types.h"
@@ -52,6 +56,20 @@ class RtlUsbAdapter {
   uint16_t _idVendor = 0;
   uint16_t _idProduct = 0;
   uint8_t  _lastH2CBox = 0;   // round-robins 0..3 across H2C mailboxes
+
+public:
+  // Serialises bulk RX (infinite_read) and bulk TX (bulk_send_sync) so the two
+  // never submit concurrent URBs on the same libusb context — concurrent sync
+  // RX + TX race the URB queue and the TX times out (station-mode TX silence).
+  // _txWaiting lets the RX loop yield its turn the instant a TX needs the bus.
+  // shared_ptr: RtlUsbAdapter is COPIED by value (RtlJaguarDevice stores a copy)
+  // but all copies wrap the SAME libusb handle, so they must share one mutex.
+  std::shared_ptr<std::mutex> _busMtx = std::make_shared<std::mutex>();
+  std::shared_ptr<std::atomic<bool>> _txWaiting =
+      std::make_shared<std::atomic<bool>>(false);
+  struct AsyncRxState;                       // defined in the .cpp
+  std::shared_ptr<AsyncRxState> _asyncRx;   // async RX URB pool (shared across copies)
+private:
 
 public:
   RtlUsbAdapter(libusb_device_handle *dev_handle, Logger_t logger);
@@ -104,6 +122,16 @@ public:
   // Needed to send the MEDIA_STATUS_RPT that makes the HW MAC act as a connected
   // station (auto-ACK auth/assoc). Returns false if the write failed.
   bool fillH2CCmd(uint8_t elementID, uint32_t cmdLen, const uint8_t *cmdBuffer);
+
+  // ---- Kernel-style async RX (APFPV station path) -------------------------
+  // Keeps `numUrbs` bulk-IN URBs permanently in flight (the 88XXau model),
+  // delivering parsed Packets to `processor` from a libusb_handle_events loop.
+  // This replaces the blocking sync infinite_read() so a concurrent async TX
+  // (send_packet) can complete — the two no longer fight over the event handler.
+  // The caller MUST run libusb_handle_events on the device's context.
+  struct AsyncRxState;
+  void startAsyncRx(std::function<void(const Packet &)> processor, int numUrbs = 8);
+  void stopAsyncRx();
 
   void rtl8812au_hw_reset();
   void _8051Reset8812();

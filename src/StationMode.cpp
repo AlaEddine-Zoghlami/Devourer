@@ -15,6 +15,7 @@
 #include <thread>
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include "RadioManagementModule.h"
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -36,14 +37,19 @@ void StationMode::arm(const MacAddr& self, const MacAddr& bssid) {
     for (int i = 0; i < 4; ++i) _dev.rtw_write8(REG_MACID + i, self.b[i]);
     _dev.rtw_write16(REG_MACID + 4, (uint16_t)(self.b[4] | (self.b[5] << 8)));
     // (2) MSR -> STATION (preserve port1 high bits)
-    uint8_t msr = (uint8_t)((_dev.rtw_read8(MSR) & 0x0C) | HW_STATE_STATION);
-    _dev.rtw_write8(MSR, msr);
+    if (!std::getenv("DEVOURER_SKIP_MSR")) {
+        uint8_t msr = (uint8_t)((_dev.rtw_read8(MSR) & 0x0C) | HW_STATE_STATION);
+        _dev.rtw_write8(MSR, msr);
+    }
     // (3) AP BSSID -> REG_BSSID
     for (int i = 0; i < 4; ++i) _dev.rtw_write8(REG_BSSID + i, bssid.b[i]);
     _dev.rtw_write16(REG_BSSID + 4, (uint16_t)(bssid.b[4] | (bssid.b[5] << 8)));
     // (4) RCR: station address-matched + accept/ACK BSSID-matched data
-    uint32_t rcr = RCR_APM | RCR_AM | RCR_AB | RCR_CBSSID_DATA | RCR_CBSSID_BCN;
-    _dev.rtw_write32(REG_RCR, rcr);
+    if (!std::getenv("DEVOURER_SKIP_RCR")) {
+        uint32_t rcr = RCR_APM | RCR_AM | RCR_AB | RCR_CBSSID_DATA | RCR_CBSSID_BCN;
+        _dev.rtw_write32(REG_RCR, rcr);
+    }
+    if (std::getenv("DEVOURER_SKIP_H2C")) { _armed = true; return; }
     // (5) Tell the FIRMWARE: MACID 0 is a CONNECTED STATION (H2C
     // MEDIA_STATUS_RPT = 0x01). The register arming above is NOT enough to make
     // the HW MAC auto-ACK the AP's auth/assoc replies (ARMING_SEQUENCE.md open
