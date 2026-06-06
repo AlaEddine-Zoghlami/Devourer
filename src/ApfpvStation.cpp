@@ -167,6 +167,14 @@ bool ApfpvStation::runConnectChain() {
         auto t0 = steady_clock::now();
         while (!_rxReady.load() && steady_clock::now() - t0 < seconds(4))
             std::this_thread::sleep_for(milliseconds(50));
+        // TX POWER: the station auth/assoc TX uses the same chip/PA the beacon-cal
+        // (startBeaconCal -> SetTxPower) and the verified-working monitor injection
+        // (txdemo SetTxPower(40)) drive — but the connect path NEVER set it, so the
+        // auth-req keyed the PA at unset/zero power = on-air silence. Set a solid
+        // index now so the frame actually radiates. (Java applies the legal-EIRP
+        // clamp via nativeStaSetTxPower; 40 here is the txdemo working value.)
+        try { rtl->SetTxPower(40); SCANLOG("station TX power set to idx 40"); }
+        catch (...) { SCANLOG("station SetTxPower threw"); }
     }
 
     // Our MAC, read NOW that the device is up (REG_MACID populated from EFUSE).
