@@ -82,6 +82,7 @@ StationMode::runProbe(const MacAddr& self, const MacAddr& bssid,
     using namespace std::chrono;
     arm(self, bssid);
     if (!_armed) return Result::Error;
+    if (_onPhase) _onPhase(1);                         // -> Authenticating
     if (!sendAuthOpenSeq1(self, bssid)) return Result::Error;
 
     auto t0 = steady_clock::now();
@@ -89,6 +90,7 @@ StationMode::runProbe(const MacAddr& self, const MacAddr& bssid,
         std::this_thread::sleep_for(milliseconds(50));
     if (!_gotAuthResp) return Result::TXFAIL_NoAuthResp;
 
+    if (_onPhase) _onPhase(2);                          // -> Associating
     std::this_thread::sleep_for(milliseconds(100));
     if (!sendAssocRequest(self, bssid, ssid)) return Result::Error;
 
@@ -131,10 +133,17 @@ ApInfo StationMode::scanForSsid(const char* ssid, int channelHint, int perChanne
                        1, 6, 11 };                     // 2.4 GHz (common)
     for (int ch : channels) {
         if (ch <= 0) continue;
+        _scanResult = ApInfo{};   // reset per channel — don't carry a bleed match over
         _rm.set_channel_bwmode((uint8_t)ch, 0, CHANNEL_WIDTH_20);  // tune radio (devourer API)
         auto t0 = steady_clock::now();
         while (steady_clock::now() - t0 < milliseconds(perChannelMs)) {
-            if (_scanResult.found) { _scanResult.channel = _scanResult.channel ? _scanResult.channel : ch; return _scanResult; }
+            // Accept only a CLEAN on-channel reception: the beacon's DS-param
+            // channel must equal the tuned channel. This rejects 2.4GHz adjacent-
+            // channel bleed (hearing a ch6 AP while tuned to ch1) that otherwise
+            // returns the WRONG channel -> we arm off-channel -> auth never ACKs.
+            if (_scanResult.found && (_scanResult.channel == ch || _scanResult.channel == 0)) {
+                _scanResult.channel = ch; return _scanResult;
+            }
             std::this_thread::sleep_for(milliseconds(20));
         }
     }

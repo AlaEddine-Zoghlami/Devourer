@@ -200,6 +200,7 @@ bool ApfpvStation::runConnectChain() {
     }
 
     set(State::Arming);
+    sta.setPhaseCb([this](int p){ set(p == 1 ? State::Authenticating : State::Associating); });
     auto r = sta.runProbe(self, bssid, _params.ssid.c_str(), /*hold*/3);
     SCANLOG("arm result: %d (0=GO 1=Deauth 2=NoAssocResp 3=TXFAIL_NoAuth 4=Error)", (int)r);
     switch (r) {

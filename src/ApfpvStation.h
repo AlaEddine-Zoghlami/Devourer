@@ -76,6 +76,7 @@ public:
 
     State state() const { return _state.load(); }
     int   rssiDbm() const { return _rssi.load(); }
+    int   channel() const { return _params.channel; }   // resolved AP channel (for UI)
     // RX path calls this on every received data/beacon frame so the supervisor
     // knows the link is alive (resets the loss timer). Wire from RxDeframe.
     void notifyRxAlive() { _lastRxMs.store(nowMs()); }

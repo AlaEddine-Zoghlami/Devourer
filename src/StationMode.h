@@ -25,7 +25,10 @@ public:
     void onMgmtFrame(uint16_t fc, const MacAddr& a1, const MacAddr& a2);
     // Feed raw mgmt frames during scan (beacon parsing).
     void onScanFrame(const uint8_t* frame, size_t len);
+    // Optional UI funnel hook: runProbe reports 1=authenticating, 2=associating.
+    void setPhaseCb(std::function<void(int)> cb) { _onPhase = std::move(cb); }
 private:
+    std::function<void(int)> _onPhase;
     RtlUsbAdapter& _dev; RadioManagementModule& _rm; SendFrameFn _send;
     bool _armed = false;
     uint32_t _pairwise = 0x000FAC04, _group = 0x000FAC04;   // default CCMP
