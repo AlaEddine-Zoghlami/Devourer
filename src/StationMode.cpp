@@ -16,6 +16,12 @@
 #include <algorithm>
 #include <cstring>
 #include "RadioManagementModule.h"
+#ifdef __ANDROID__
+#include <android/log.h>
+#define SMLOG(...) __android_log_print(ANDROID_LOG_INFO, "apfpv-arm", __VA_ARGS__)
+#else
+#define SMLOG(...) ((void)0)
+#endif
 
 namespace apfpv {
 
@@ -68,7 +74,9 @@ static inline uint8_t fc_subtype(uint16_t fc) { return (fc >> 4) & 0xF; }
 
 void StationMode::onMgmtFrame(uint16_t fc, const MacAddr&, const MacAddr&) {
     if (fc_type(fc) != 0x0) return;          // mgmt only
-    switch (fc_subtype(fc)) {
+    uint8_t sub = fc_subtype(fc);
+    if (sub != 0x8) SMLOG("rx mgmt subtype 0x%X", sub);   // log non-beacon mgmt (auth/assoc/deauth)
+    switch (sub) {
         case 0xB: _gotAuthResp = true; break;  // Auth
         case 0x1: _gotAssocOk  = true; break;  // Assoc-Resp
         case 0xC: case 0xA: _gotDeauth = true; break;  // Deauth/Disassoc
@@ -81,14 +89,20 @@ StationMode::runProbe(const MacAddr& self, const MacAddr& bssid,
                       const char* ssid, int holdSeconds) {
     using namespace std::chrono;
     arm(self, bssid);
+    SMLOG("arm: self %02x:%02x:%02x:%02x:%02x:%02x -> bssid %02x:%02x:%02x:%02x:%02x:%02x",
+          self.b[0],self.b[1],self.b[2],self.b[3],self.b[4],self.b[5],
+          bssid.b[0],bssid.b[1],bssid.b[2],bssid.b[3],bssid.b[4],bssid.b[5]);
     if (!_armed) return Result::Error;
     if (_onPhase) _onPhase(1);                         // -> Authenticating
-    if (!sendAuthOpenSeq1(self, bssid)) return Result::Error;
+    bool sent = sendAuthOpenSeq1(self, bssid);
+    SMLOG("auth-req tx sent=%d, waiting 3s for auth-resp...", sent ? 1 : 0);
+    if (!sent) return Result::Error;
 
     auto t0 = steady_clock::now();
     while (!_gotAuthResp && !_gotDeauth && steady_clock::now() - t0 < seconds(3))
         std::this_thread::sleep_for(milliseconds(50));
-    if (!_gotAuthResp) return Result::TXFAIL_NoAuthResp;
+    if (!_gotAuthResp) { SMLOG("NO auth-resp (deauth=%d)", _gotDeauth.load()); return Result::TXFAIL_NoAuthResp; }
+    SMLOG("got auth-resp! sending assoc-req...");
 
     if (_onPhase) _onPhase(2);                          // -> Associating
     std::this_thread::sleep_for(milliseconds(100));
