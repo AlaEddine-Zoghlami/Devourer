@@ -115,14 +115,8 @@ bool ApfpvStation::runConnectChain() {
     };
     StationMode sta(dev, rm, sendFrame);
     MacAddr self{}, bssid{};
-    // Derive our own MAC from the adapter (REG_MACID, populated from EFUSE by
-    // devourer init). Without this, WPA2 PTK derivation + frame addr2 are zero
-    // and the AP rejects us. 0x0610 = REG_MACID.
-    for (int i = 0; i < 6; ++i) self.b[i] = dev.rtw_read8(0x0610 + i);
-    // If unprogrammed (all 0/FF), synthesize a locally-administered MAC.
-    bool bad = true; for (int i=0;i<6;i++){ if(self.b[i]!=0 && self.b[i]!=0xFF) bad=false; }
-    if (bad) { self.b[0]=0x02; self.b[1]=0x11; self.b[2]=0x22;
-               self.b[3]=0x33; self.b[4]=0x44; self.b[5]=0x55; }
+    // NOTE: our MAC is read from REG_MACID AFTER the device is brought up (below).
+    // Reading it before Init returned EFUSE-unloaded garbage (e.g. ea:ea:ea:...).
 
     // Bring the PHY/RF up BEFORE any channel change (scanForSsid + arm call
     // set_channel_bwmode -> phy_SwChnl8812, which null-derefs if never Init'd),
@@ -174,6 +168,14 @@ bool ApfpvStation::runConnectChain() {
         while (!_rxReady.load() && steady_clock::now() - t0 < seconds(4))
             std::this_thread::sleep_for(milliseconds(50));
     }
+
+    // Our MAC, read NOW that the device is up (REG_MACID populated from EFUSE).
+    // Used as addr2 in auth/assoc + for WPA2 PTK; a garbage MAC makes the AP
+    // reply to a bogus address. 0x0610 = REG_MACID.
+    for (int i = 0; i < 6; ++i) self.b[i] = dev.rtw_read8(0x0610 + i);
+    bool bad = true; for (int i=0;i<6;i++){ if(self.b[i]!=0 && self.b[i]!=0xFF) bad=false; }
+    if (bad) { self.b[0]=0x02; self.b[1]=0x11; self.b[2]=0x22;
+               self.b[3]=0x33; self.b[4]=0x44; self.b[5]=0x55; }
 
     // DISCOVERY: scan beacons for the SSID -> BSSID + channel + negotiated RSN.
     // Removes the hardcoded-channel / empty-BSSID / fixed-cipher assumptions
