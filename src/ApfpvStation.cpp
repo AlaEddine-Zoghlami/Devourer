@@ -82,9 +82,12 @@ void ApfpvStation::startBeaconCal(const std::string& ssid, int channel, int txIn
         std::vector<uint8_t> frame(40 + mpdu.size(), 0);   // 40 = 8812 TX desc
         std::memcpy(frame.data() + 40, mpdu.data(), mpdu.size());
         FillStationTxDesc(frame.data(), (uint16_t)mpdu.size(), 40,
-                          0, StationFrameKind::Mgmt, 0, 0x04);
+                          0, StationFrameKind::BroadcastMgmt, 0, 0x04);   // BMC=1, no ACK
+        int n = 0;
         while (_beaconRun.load()) {
-            try { dev->send_packet(frame.data(), frame.size()); } catch (...) {}
+            bool ok = false;
+            try { ok = dev->send_packet(frame.data(), frame.size()); } catch (...) {}
+            if ((n++ % 20) == 0) SCANLOG("beacon: tx #%d ok=%d len=%zu", n, (int)ok, frame.size());
             std::this_thread::sleep_for(std::chrono::milliseconds(100));   // ~10 beacons/s
         }
     });
@@ -121,15 +124,24 @@ bool ApfpvStation::runConnectChain() {
     // (auth/assoc/deauth -> onMgmtFrame) actually receive. Previously this used a
     // no-op processor, so _scanResult and _gotAuthResp were never set -> the link
     // always failed at discovery. The real RxDeframe RX is wired after handshake.
+    { std::lock_guard<std::mutex> lk(_scanMtx); _scanSeen.clear(); }   // diag: SSIDs heard
     if (_rtl) {
         StationMode* sp = &sta;
         try {
             reinterpret_cast<RtlJaguarDevice*>(_rtl)->Init(
-                [sp](const Packet& pkt){
+                [sp, this](const Packet& pkt){
                     const uint8_t* f = pkt.Data.data(); size_t n = pkt.Data.size();
                     if (n < 24) return;
                     uint16_t fc = (uint16_t)(f[0] | (f[1] << 8));
                     sp->onScanFrame(f, n);              // beacons -> _scanResult
+                    // DIAG: log each unique SSID the dongle hears during discovery,
+                    // so we can see whether the target beacon is reaching the RX.
+                    std::string ss; ApInfo bi;
+                    if (ScanProbe::parseAnyBeacon(f, n, ss, bi) && !ss.empty()) {
+                        std::lock_guard<std::mutex> lk(_scanMtx);
+                        if (_scanSeen.insert(ss).second)
+                            SCANLOG("discovery heard \"%s\" ch%d", ss.c_str(), bi.channel);
+                    }
                     MacAddr a1{}, a2{};
                     std::memcpy(a1.b.data(), f + 4,  6);
                     std::memcpy(a2.b.data(), f + 10, 6);
