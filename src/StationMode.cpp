@@ -44,6 +44,15 @@ void StationMode::arm(const MacAddr& self, const MacAddr& bssid) {
     // (4) RCR: station address-matched + accept/ACK BSSID-matched data
     uint32_t rcr = RCR_APM | RCR_AM | RCR_AB | RCR_CBSSID_DATA | RCR_CBSSID_BCN;
     _dev.rtw_write32(REG_RCR, rcr);
+    // (5) Tell the FIRMWARE: MACID 0 is a CONNECTED STATION (H2C
+    // MEDIA_STATUS_RPT = 0x01). The register arming above is NOT enough to make
+    // the HW MAC auto-ACK the AP's auth/assoc replies (ARMING_SEQUENCE.md open
+    // question, confirmed by hardware test). Port of the Linux driver's
+    // rtw_hal_set_FwMediaStatusRpt_cmd(RT_MEDIA_CONNECT, macid=0):
+    //   parm[0]: bit0 opmode=1 (connect), bit1 macid_ind=0 ; parm[1]=macid.
+    uint8_t msrParm[3] = { 0x01, 0x00, 0x00 };
+    bool h2c = _dev.fillH2CCmd(0x01 /*H2C_MEDIA_STATUS_RPT*/, 3, msrParm);
+    SMLOG("media-status-rpt H2C (connect macid0) sent=%d", h2c ? 1 : 0);
     _armed = true;
 }
 

@@ -51,6 +51,7 @@ class RtlUsbAdapter {
 
   uint16_t _idVendor = 0;
   uint16_t _idProduct = 0;
+  uint8_t  _lastH2CBox = 0;   // round-robins 0..3 across H2C mailboxes
 
 public:
   RtlUsbAdapter(libusb_device_handle *dev_handle, Logger_t logger);
@@ -98,6 +99,11 @@ public:
   }
 
   bool WriteBytes(uint16_t reg_num, uint8_t *ptr, size_t size);
+
+  // Host-to-Card firmware command (8812 mailbox: REG_HMEBOX_0 / EXT_0, 4 boxes).
+  // Needed to send the MEDIA_STATUS_RPT that makes the HW MAC act as a connected
+  // station (auto-ACK auth/assoc). Returns false if the write failed.
+  bool fillH2CCmd(uint8_t elementID, uint32_t cmdLen, const uint8_t *cmdBuffer);
 
   void rtl8812au_hw_reset();
   void _8051Reset8812();

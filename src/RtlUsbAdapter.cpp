@@ -13,8 +13,50 @@
 #include <iomanip>
 #include <iostream>
 #include <thread>
+#include <cstring>
 
 using namespace std::chrono_literals;
+
+// 8812 H2C mailbox (see hal_com_reg.h). 4 boxes, 4 bytes each.
+#define DEV_REG_HMETFR        0x01CC
+#define DEV_REG_HMEBOX_0      0x01D0
+#define DEV_REG_HMEBOX_EXT_0  0x01F0
+#define DEV_H2C_BOX_SIZE      4
+#define DEV_MAX_H2C_BOX       4
+
+// Port of fill_h2c_cmd_8812 (aircrack-ng/rtl8812au hal/rtl8812a/rtl8812a_cmd.c):
+// ElementID in the low byte, up to 3 payload bytes in the primary box, the rest
+// in the extended box. Write EXT first, then the primary box (that triggers the
+// firmware read). Round-robin the 4 boxes; wait for the box to drain first.
+bool RtlUsbAdapter::fillH2CCmd(uint8_t elementID, uint32_t cmdLen,
+                               const uint8_t *cmdBuffer) {
+  if (cmdLen > 0 && !cmdBuffer) return false;
+  if (cmdLen > 7) return false;                       // 3 primary + 4 ext
+  uint8_t box = _lastH2CBox % DEV_MAX_H2C_BOX;
+  // Wait until this box has been read by the FW (REG_HMETFR bit(box) == 0).
+  for (int i = 0; i < 100; ++i) {
+    uint8_t st = 0;
+    try { st = rtw_read8(DEV_REG_HMETFR); } catch (...) { return false; }
+    if ((st & (1u << box)) == 0) break;
+    std::this_thread::sleep_for(1ms);
+  }
+  uint32_t h2c_cmd = 0, h2c_cmd_ex = 0;
+  uint8_t *pc = reinterpret_cast<uint8_t *>(&h2c_cmd);
+  pc[0] = elementID;
+  if (cmdLen <= 3) {
+    if (cmdLen) std::memcpy(pc + 1, cmdBuffer, cmdLen);
+  } else {
+    std::memcpy(pc + 1, cmdBuffer, 3);
+    std::memcpy(&h2c_cmd_ex, cmdBuffer + 3, cmdLen - 3);
+  }
+  bool ok = true;
+  try {
+    ok &= rtw_write32((uint16_t)(DEV_REG_HMEBOX_EXT_0 + box * DEV_H2C_BOX_SIZE), h2c_cmd_ex);
+    ok &= rtw_write32((uint16_t)(DEV_REG_HMEBOX_0     + box * DEV_H2C_BOX_SIZE), h2c_cmd);
+  } catch (...) { ok = false; }
+  _lastH2CBox = (uint8_t)((box + 1) % DEV_MAX_H2C_BOX);
+  return ok;
+}
 
 RtlUsbAdapter::RtlUsbAdapter(libusb_device_handle *dev_handle, Logger_t logger)
     : _dev_handle{dev_handle}, _logger{logger} {
