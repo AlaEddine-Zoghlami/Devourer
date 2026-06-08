@@ -1,140 +1,35 @@
 cmake_minimum_required(VERSION 3.15)
+project(Devourer)
 
-# Set the toolchain file for vcpkg on Windows ONLY if vcpkg is actually present.
-# (MSYS2/MinGW builds use pkg-config directly and must skip this.)
 if(WIN32 AND DEFINED ENV{VCPKG_ROOT} AND NOT "$ENV{VCPKG_ROOT}" STREQUAL "")
     set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
 endif()
 
-project(Rtl8812auNet)
-
-# Find pkg-config and then use it to locate libusb.
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(libusb REQUIRED IMPORTED_TARGET libusb-1.0)
 
-add_library(WiFiDriver
-    src/logger.h
+# The libusb RTL8812AU driver + Station L2 + crypto live in the WiFiDriver submodule.
+add_subdirectory(extern/WiFiDriver)
 
-    hal/Hal8812PhyReg.h
-    hal/Hal8812PwrSeq.c
-    hal/Hal8812PwrSeq.h
-    hal/Hal8812a_TxPwrTrack.cpp
-    hal/Hal8812a_TxPwrTrack.h
-    hal/Hal8814_PostFwdlReplay.h
-    hal/Hal8814PwrSeq.c
-    hal/Hal8814PwrSeq.h
-    hal/Hal8821APwrSeq.c
-    hal/Hal8821APwrSeq.h
-    hal/Hal8821PhyReg.h
-    hal/basic_types.h
-    hal/hal8812a_fw.c
-    hal/hal8812a_fw.h
-    hal/hal8814a_fw.c
-    hal/hal8814a_fw.h
-    hal/hal8821a_fw.c
-    hal/hal8821a_fw.h
-    hal/hal_com_reg.h
-    hal/rtl8812a_hal.h
-    hal/rtl8812a_recv.h
-    hal/rtl8812a_spec.h
+# ---------------------------------------------------------------------------
+#  devourer — layered ON TOP of WiFiDriver. Adds the IP layer (DHCP / static-IP
+#  / ARP), the FPV + session glue (RTP relay, LQ feedback, RxDeframe demux,
+#  ApfpvStation orchestration + auto-reconnect), and the AP-side WPA2
+#  authenticator (WIP). The JNI lives with the app's Android build.
+# ---------------------------------------------------------------------------
+add_library(devourer
+    src/ApfpvStation.cpp      src/ApfpvStation.h
+    src/ApfpvDhcp.cpp         src/ApfpvDhcp.h
+    src/RxDeframe.cpp         src/RxDeframe.h
+    src/LqFeedback.cpp        src/LqFeedback.h
+    src/Wpa2Authenticator.cpp src/Wpa2Authenticator.h)
+target_compile_features(devourer PUBLIC cxx_std_20)
+target_include_directories(devourer PUBLIC src)
+target_link_libraries(devourer PUBLIC WiFiDriver)   # propagates WiFiDriver's headers (hal, src, crypto)
 
-    # RTL8814AU phydm-format register tables. The .c file is generated from the
-    # aircrack-ng/rtl8814au tree by tools/extract_8814a_phy_tables.py; the
-    # loader at src/PhyTableLoader walks the same conditional encoding the
-    # upstream phydm parser does, without pulling in phydm itself.
-    hal/phydm/rtl8814a/Hal8814_PhyTables.c
-    hal/phydm/rtl8814a/Hal8814_PhyTables.h
-
-    src/ieee80211_radiotap.h
-    src/EepromManager.cpp
-    src/EepromManager.h
-    src/Firmware.h
-    src/FirmwareManager.cpp
-    src/FirmwareManager.h
-    src/FrameParser.cpp
-    src/FrameParser.h
-    src/HalModule.cpp
-    src/HalModule.h
-    src/Iqk8812a.cpp
-    src/Iqk8812a.h
-    src/Iqk8814a.cpp
-    src/Iqk8814a.h
-    src/PhydmWatchdog.cpp
-    src/PhydmWatchdog.h
-    src/ParsedRadioPacket.cpp
-    src/PhyTableLoader.cpp
-    src/PhyTableLoader.h
-    src/PowerTracking8812a.cpp
-    src/PowerTracking8812a.h
-    src/RadioManagementModule.cpp
-    src/RadioManagementModule.h
-    src/Radiotap.c
-    src/RtlJaguarDevice.cpp
-    src/RtlJaguarDevice.h
-    src/RtlUsbAdapter.cpp
-    src/RtlUsbAdapter.h
-    src/SelectedChannel.h
-    src/WiFiDriver.cpp
-    src/WiFiDriver.h
-    src/StationMode.cpp
-    src/StationMode.h
-    src/StationTxDesc.cpp
-    src/StationTxDesc.h
-    src/Dot11Frames.cpp
-    src/Dot11Frames.h
-    src/Wpa2Supplicant.cpp
-    src/Wpa2Supplicant.h
-    src/Wpa2Authenticator.cpp
-    src/Wpa2Authenticator.h
-    src/Wpa2Crypto.cpp
-    src/Wpa2Crypto.h
-    src/ApfpvDhcp.cpp
-    src/ApfpvDhcp.h
-    src/LqFeedback.cpp
-    src/LqFeedback.h
-    src/RxDeframe.cpp
-    src/RxDeframe.h
-    src/ApfpvStation.cpp
-    src/ApfpvStation.h
-    src/ScanProbe.cpp
-    src/ScanProbe.h
-    src/crypto/Sha1Hmac.cpp
-    src/crypto/Sha1Hmac.h
-    src/crypto/AesCcm.cpp
-    src/crypto/AesCcm.h
-    src/crypto/AesCmac.cpp
-    src/crypto/AesCmac.h
-    src/registry_priv.h
-)
-
-target_compile_features(WiFiDriver PUBLIC cxx_std_20)
-
-# Link WiFiDriver with libusb as found via pkg-config.
-target_link_libraries(WiFiDriver PUBLIC PkgConfig::libusb)
-# Windows (MSYS2/MinGW): the LQ/RTP/DHCP socket code needs winsock.
-if(WIN32)
-    target_link_libraries(WiFiDriver PUBLIC ws2_32)   # winsock (LQ/RTP/DHCP/relay sockets)
-    target_link_libraries(WiFiDriver PUBLIC bcrypt)    # CNG BCryptGenRandom (secure SNonce)
-endif()
-
-target_include_directories(WiFiDriver PUBLIC hal)
-target_include_directories(WiFiDriver PUBLIC hal/phydm/rtl8814a)
-target_include_directories(WiFiDriver PUBLIC src)
-
-add_executable(WiFiDriverDemo
-    demo/main.cpp
-)
-target_link_libraries(WiFiDriverDemo PUBLIC WiFiDriver)
-
-add_executable(WiFiDriverTxDemo
-    txdemo/main.cpp
-)
-target_link_libraries(WiFiDriverTxDemo PUBLIC WiFiDriver PRIVATE PkgConfig::libusb)
-
-# APFPV ACK-survival probe (Linux laptop test target — run BEFORE Android)
-add_executable(ApfpvProbe demo/apfpv_probe.cpp)
-target_link_libraries(ApfpvProbe PUBLIC WiFiDriver PRIVATE PkgConfig::libusb)
-
-# APFPV behavior compliance suite (scan/connect/reconnect/create-ap)
+# Host test/demo targets (Linux/Windows): the APFPV behavior suite + ACK-survival probe.
 add_executable(ApfpvCompliance demo/apfpv_compliance.cpp)
-target_link_libraries(ApfpvCompliance PUBLIC WiFiDriver PRIVATE PkgConfig::libusb)
+target_link_libraries(ApfpvCompliance PUBLIC devourer PRIVATE PkgConfig::libusb)
+
+add_executable(ApfpvProbe demo/apfpv_probe.cpp)
+target_link_libraries(ApfpvProbe PUBLIC devourer PRIVATE PkgConfig::libusb)

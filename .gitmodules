@@ -1,0 +1,3 @@
+[submodule "extern/WiFiDriver"]
+	path = extern/WiFiDriver
+	url = https://github.com/AlaEddine-Zoghlami/WiFiDriver.git
