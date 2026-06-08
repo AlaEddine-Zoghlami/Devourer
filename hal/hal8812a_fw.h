@@ -30,7 +30,7 @@ extern u32 array_length_mp_8812a_fw_ap;
 #endif
 
 #if (DM_ODM_SUPPORT_TYPE & (ODM_WIN)) || (DM_ODM_SUPPORT_TYPE & (ODM_CE))
-extern u8 array_mp_8812a_fw_nic[27054];
+extern u8 array_mp_8812a_fw_nic[27030];
 extern u32 array_length_mp_8812a_fw_nic;
 extern u8 array_mp_8812a_fw_nic_bt[29918];
 extern u32 array_length_mp_8812a_fw_nic_bt;

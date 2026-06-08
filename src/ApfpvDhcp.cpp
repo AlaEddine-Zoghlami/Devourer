@@ -69,6 +69,7 @@ void ApfpvDhcp::onBootpReply(const uint8_t* p, size_t len) {
     }
     if (_state == St::Discover && msgType == 2) {      // OFFER -> REQUEST
         _state = St::Request;
+        _offerIp = yi; _offerSid = sid;                // remember for REQUEST retransmits
         _send(buildRequest(yi, sid));
     } else if (_state == St::Request && msgType == 5) { // ACK -> bound
         _lease.ip = yi; _lease.netmask = mask; _lease.server = sid; _lease.valid = true;
@@ -76,8 +77,17 @@ void ApfpvDhcp::onBootpReply(const uint8_t* p, size_t len) {
     }
 }
 
-void ApfpvDhcp::claimStatic_192_168_0_10() {
-    _lease.ip = 0xC0A8000A; _lease.netmask = 0xFFFFFF00; _lease.server = 0xC0A80001;
+void ApfpvDhcp::retransmit() {
+    // Resend whichever message we're waiting on a reply for, WITHOUT resetting the state
+    // machine — so a missed ACK retries the REQUEST (not a fresh DISCOVER that restarts DORA).
+    if (_state == St::Discover || _state == St::Init) _send(buildDiscover());
+    else if (_state == St::Request) _send(buildRequest(_offerIp, _offerSid));
+}
+
+void ApfpvDhcp::claimStatic(uint32_t ip, uint32_t netmask, uint32_t gateway) {
+    if (netmask == 0) netmask = 0xFFFFFF00;            // default /24
+    if (gateway == 0) gateway = (ip & netmask) | 1;   // default = subnet's .1
+    _lease.ip = ip; _lease.netmask = netmask; _lease.server = gateway;
     _lease.valid = true; _state = St::Bound;
 }
 

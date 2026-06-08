@@ -18,10 +18,22 @@ public:
     // the DHCP state machine can advance OFFER->REQUEST->ACK->Bound.
     using OnDhcpFn = std::function<void(const uint8_t*, size_t)>;
     void setDhcpSink(OnDhcpFn fn) { _onDhcp = std::move(fn); }
+    // General-IP sink (the VpnService TUN): the FULL decrypted IPv4 packet, so SSH/any
+    // TCP+UDP traverses the dongle — not just RTP. The OS then routes it (RTP->5600, SSH->22).
+    using OnIpFn = std::function<void(const uint8_t*, size_t)>;
+    void setIpSink(OnIpFn fn) { _onIp = std::move(fn); }
+    // ARP responder: answer "who has <ourIp>?" so peers (the VTX unicasting RTP video, SSH,
+    // ...) keep a FRESH ARP entry for us — without it a STALE entry fails to re-validate and
+    // the unicast stream stops after a frame or two. send() gets the encrypted ARP-reply MPDU.
+    void setArp(uint32_t ourIp, std::function<void(const std::vector<uint8_t>&)> send) {
+        _ourIp = ourIp; _arpSend = std::move(send);
+    }
 private:
     static int toDbm(uint8_t r);
     Mac _self, _bssid; Wpa2Supplicant* _wpa; LqFeedback* _lq; OnRtpFn _onRtp;
-    OnDhcpFn _onDhcp;
+    OnDhcpFn _onDhcp; OnIpFn _onIp;
+    uint32_t _ourIp = 0;
+    std::function<void(const std::vector<uint8_t>&)> _arpSend;
     ApfpvStation* _station = nullptr;
 };
 }

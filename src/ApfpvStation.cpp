@@ -8,6 +8,8 @@
 #include "ApfpvStation.h"
 #include "StationMode.h"
 #include "Wpa2Supplicant.h"
+#include "Wpa2Authenticator.h"
+#include "hal_com_reg.h"     // MSR / REG_BSSID / REG_RCR / RCR_* / FORCEACK for AP-mode HW config
 #include "Wpa2Crypto.h"
 #include "ApfpvDhcp.h"
 #include "RxDeframe.h"
@@ -76,6 +78,13 @@ void ApfpvStation::startBeaconCal(const std::string& ssid, int channel, int txIn
         rtl->Init([](const Packet&){}, legalApfpvChannel(channel, 20));   // tune + bring up
         rtl->SetTxPower((uint8_t)std::max(0, std::min(63, txIndex)));
     } catch (...) { return; }
+    // **TX-RADIATION FIX.** The init/channel-set IQK (Iqk8812a::ConfigureMac) pauses
+    // all 6 TX queues (REG_TXPAUSE 0x522 = 0x3f) for calibration. The beacon/monitor
+    // path had NO clear (only the station arm() path got one), so the MAC drained the
+    // FIFO ("injected OK") but the scheduler never keyed the PHY/PA -> zero RF on air.
+    // Release the queues unconditionally (mirrors StationMode.cpp arm step 4c).
+    dev->rtw_write8(0x0522, 0x00);
+    SCANLOG("beacon: REG_TXPAUSE -> 0x%02x", dev->rtw_read8(0x0522));
     // our MAC (REG_MACID); synthesize a locally-administered one if unprogrammed
     Mac self{};
     for (int i = 0; i < 6; ++i) self[i] = dev->rtw_read8(0x0610 + i);
@@ -91,6 +100,7 @@ void ApfpvStation::startBeaconCal(const std::string& ssid, int channel, int txIn
                           0, StationFrameKind::BroadcastMgmt, 0, 0x04);   // BMC=1, no ACK
         int n = 0;
         while (_beaconRun.load()) {
+            dev->rtw_write8(0x0522, 0x00);   // keep all TX queues released every beacon
             bool ok = false;
             try { ok = dev->send_packet(frame.data(), frame.size()); } catch (...) {}
             if ((n++ % 20) == 0) SCANLOG("beacon: tx #%d ok=%d len=%zu", n, (int)ok, frame.size());
@@ -104,6 +114,284 @@ void ApfpvStation::stopBeaconCal() {
     if (_beaconThread.joinable()) _beaconThread.join();
 }
 
+// ---- AP MODE (SoftAP) -------------------------------------------------------
+void ApfpvStation::apSend(const std::vector<uint8_t>& mpdu, bool eapol) {
+    auto* dev = reinterpret_cast<RtlUsbAdapter*>(_dev);
+    if (!dev || mpdu.empty()) return;
+    std::vector<uint8_t> frame(40 + mpdu.size(), 0);
+    std::memcpy(frame.data()+40, mpdu.data(), mpdu.size());
+    FillStationTxDesc(frame.data(), (uint16_t)mpdu.size(), 40, 0,
+                      eapol ? StationFrameKind::EapolData : StationFrameKind::Mgmt, 0, 0x04);
+    dev->rtw_write8(0x0522, 0x00);
+    try { dev->send_packet(frame.data(), frame.size()); } catch (...) {}
+}
+
+void ApfpvStation::apTrack(const Mac& sta, uint8_t rssiRaw, int state) {
+    int dbm = (int)(rssiRaw & 0x7f) - 110; if (dbm < -100) dbm = -100; if (dbm > -10) dbm = -10;
+    std::lock_guard<std::mutex> lk(_apMtx);
+    for (auto& s : _apStaList) if (s.mac == sta) { s.rssiDbm = dbm; if (state >= 0) s.state = state; return; }
+    _apStaList.push_back(ApStation{sta, dbm, state >= 0 ? state : 4});
+}
+
+std::vector<ApfpvStation::ApStation> ApfpvStation::apStations() {
+    std::lock_guard<std::mutex> lk(_apMtx);
+    return _apStaList;
+}
+
+void ApfpvStation::apOnRx(const uint8_t* f, size_t len, uint8_t rssiRaw) {
+    if (len < 24) return;
+    uint16_t fc = f[0] | (f[1] << 8);
+    uint8_t type = (fc >> 2) & 0x3, sub = (fc >> 4) & 0xf;
+    static int g_apRxN = 0;
+    if ((++g_apRxN % 100) == 1) fprintf(stderr, "[ap-rx-any] #%d type=%u sub=%u len=%zu\n", g_apRxN, type, sub, len);
+    Mac a1, a2; std::memcpy(a1.data(), f+4, 6); std::memcpy(a2.data(), f+10, 6);
+    bool toUs = std::memcmp(a1.data(), _apSelf.data(), 6) == 0;
+    bool grp  = (f[4] & 0x01);
+    if (type == 0) {                                       // management
+        if ((sub==4||sub==11||sub==0) && (toUs||grp))
+            fprintf(stderr, "[ap-rx] mgmt sub=%u from %02x:%02x:%02x:%02x:%02x:%02x toUs=%d\n",
+                    sub, a2[0],a2[1],a2[2],a2[3],a2[4],a2[5], (int)toUs);
+        if (sub == 4 && (toUs || grp)) {                  // Probe Request -> Probe Response
+            apTrack(a2, rssiRaw, -1);
+            apSend(BuildProbeResp(_apSelf, a2, _apSsid, (uint8_t)_apChannel, _apWpa2), false);
+        } else if (sub == 11 && toUs) {                   // Auth (open seq1) -> Auth Resp (seq2)
+            apTrack(a2, rssiRaw, -1);
+            apSend(BuildAuthResp(_apSelf, a2), false);
+        } else if (sub == 0 && toUs) {                    // Assoc Request -> Assoc Resp [+ 4-way]
+            apTrack(a2, rssiRaw, 4);
+            apSend(BuildAssocResp(_apSelf, a2, 1), false);
+            if (_apWpa2) {
+                _apAuth = std::make_unique<Wpa2Authenticator>(MakeWpa2Crypto(),
+                    [this](const std::vector<uint8_t>& m){ apSend(m, true); return true; });
+                _apAuth->begin(_apPmk, _apSelf, a2, _apGtk, 1);
+                _apAuth->startHandshake();
+            } else apTrack(a2, rssiRaw, 7);               // open: associated == connected
+        }
+        return;
+    }
+    if (type == 2 && toUs) {                               // data from the station (to-DS)
+        size_t hdr = 24; if (fc & 0x0080) hdr += 2;       // QoS-data
+        if (len < hdr + 8) return;
+        const uint8_t* llc = f + hdr;
+        static const uint8_t snap[6] = {0xaa,0xaa,0x03,0x00,0x00,0x00};
+        if (std::memcmp(llc, snap, 6) == 0 && ((llc[6]<<8)|llc[7]) == 0x888E && _apAuth) {
+            apTrack(a2, rssiRaw, -1);
+            if (_apAuth->onEapolKey(llc + 8, (len - hdr) - 8)) apTrack(a2, rssiRaw, 7);  // 4-way done
+        }
+    }
+}
+
+// ⚠️⚠️ WORK IN PROGRESS — NOT a usable SoftAP yet. The dongle beacons (open/WPA2), tracks
+// clients + RSSI, and the full WPA2 Authenticator (Wpa2Authenticator) is implemented + crypto
+// self-tested. BUT a client cannot complete association: that needs the 8812 AP/master-mode HW
+// bring-up (HW beacon queue + TSF + per-station ACK/MACID registration), which the userspace
+// monitor path doesn't provide. Setting MSR=AP even stops the injected beacon from radiating
+// (HW expects beacons from its own queue). Station mode is the production path; do NOT expose
+// AP mode until the AP-mode HW driver path is ported. Kept here as in-progress scaffolding.
+void ApfpvStation::startAp(const std::string& ssid, int channel, const std::string& password) {
+    stopAp(); stopBeaconCal(); disconnect();
+    if (!_rtl || !_dev) return;
+    auto* rtl = reinterpret_cast<RtlJaguarDevice*>(_rtl);
+    auto* dev = reinterpret_cast<RtlUsbAdapter*>(_dev);
+    _apWpa2 = !password.empty(); _apChannel = channel; _apSsid = ssid;
+    { std::lock_guard<std::mutex> lk(_apMtx); _apStaList.clear(); }
+    _apAuth.reset();
+
+    Mac self{};                          // self MAC = BSSID (synthesize if unprogrammed)
+    for (int i = 0; i < 6; ++i) self[i] = dev->rtw_read8(0x0610 + i);
+    bool bad = true; for (int i=0;i<6;i++) if (self[i]!=0 && self[i]!=0xFF) bad=false;
+    if (bad) { const uint8_t m[6]={0x02,0x11,0x22,0x33,0x44,0x55}; for(int i=0;i<6;i++) self[i]=m[i]; }
+    _apSelf = self;
+
+    if (_apWpa2) {
+        Crypto c = MakeWpa2Crypto();
+        _apPmk = c.pbkdf2_pmk(password, (const uint8_t*)ssid.data(), ssid.size());
+        FILE* u = fopen("/dev/urandom","rb");                 // random GTK (broadcast key)
+        if (u) { size_t r=fread(_apGtk.data(),1,16,u); (void)r; fclose(u); }
+        else { for (int i=0;i<16;i++) _apGtk[i] = (uint8_t)((i*97)^0x3c); }
+    }
+
+    try {
+        SelectedChannel sc = legalApfpvChannel(channel, 20);
+        rtl->Init([](const Packet&){}, sc);          // device bring-up (firmware/PHY/channel)
+        rtl->SetTxPower(40);
+        rtl->StopAsyncRx();                           // then the PUMPED async RX (host event loop
+        rtl->StartMonitorAsyncRx(                     // drives the URBs) so apOnRx actually fires —
+            [this](const Packet& p){ apOnRx(p.Data.data(), p.Data.size(), p.RxAtrib.rssi[0]); }, sc);
+    } catch (...) { return; }
+    dev->rtw_write8(0x0522, 0x00);
+    // EXPERIMENTAL (opt-in via DEVOURER_AP_HWACK) AP/master HW config — FORCEACK + MSR=AP to
+    // auto-ACK clients. OFF by default: MSR=AP currently stops the injected beacon from
+    // radiating (the HW expects beacons from its own queue), so default startAp keeps the
+    // visible beacon + RSSI tracking working. Part of the WIP AP-mode HW bring-up.
+    if (std::getenv("DEVOURER_AP_HWACK")) {
+        for (int i = 0; i < 4; ++i) dev->rtw_write8(REG_MACID + i, self[i]);
+        dev->rtw_write16(REG_MACID + 4, (uint16_t)(self[4] | (self[5] << 8)));
+        for (int i = 0; i < 4; ++i) dev->rtw_write8(REG_BSSID + i, self[i]);
+        dev->rtw_write16(REG_BSSID + 4, (uint16_t)(self[4] | (self[5] << 8)));
+        dev->rtw_write8(MSR, (uint8_t)((dev->rtw_read8(MSR) & 0x0C) | 0x03));  // MSR = AP
+        dev->rtw_write32(REG_RCR, RCR_APM | RCR_AM | RCR_AB | RCR_ADF | RCR_ACF |
+                                  RCR_APP_ICV | RCR_AMF | RCR_HTC_LOC_CTRL | RCR_APP_MIC |
+                                  RCR_APP_PHYST_RXFF | RCR_APPFCS | FORCEACK);
+    }
+
+    auto beacon = BuildBeacon(self, ssid, (uint8_t)channel, _apWpa2);
+    _apRun.store(true); _beaconRun.store(true);
+    _beaconThread = std::thread([this, dev, beacon]() {
+        std::vector<uint8_t> frame(40 + beacon.size(), 0);
+        std::memcpy(frame.data()+40, beacon.data(), beacon.size());
+        FillStationTxDesc(frame.data(), (uint16_t)beacon.size(), 40, 0,
+                          StationFrameKind::BroadcastMgmt, 0, 0x04);
+        while (_beaconRun.load()) {
+            dev->rtw_write8(0x0522, 0x00);
+            try { dev->send_packet(frame.data(), frame.size()); } catch (...) {}
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    });
+    SCANLOG("AP up: ssid=\"%s\" ch=%d %s bssid=%02x:%02x:%02x:%02x:%02x:%02x", ssid.c_str(), channel,
+            _apWpa2?"WPA2-PSK":"OPEN", self[0],self[1],self[2],self[3],self[4],self[5]);
+}
+
+void ApfpvStation::stopAp() {
+    _apRun.store(false);
+    stopBeaconCal();
+    if (_rtl) { try { reinterpret_cast<RtlJaguarDevice*>(_rtl)->StopAsyncRx(); } catch (...) {} }  // else hangs on exit
+    _apAuth.reset();
+}
+
+static uint16_t ipChecksum(const uint8_t* p, size_t n);
+static std::vector<uint8_t> buildTcp(uint32_t srcIp, uint32_t dstIp, uint16_t sport, uint16_t dport,
+                                     uint32_t seq, uint32_t ack, uint8_t flags,
+                                     const uint8_t* payload, size_t plen);
+
+// Compute the WPA2 PMK (PBKDF2, slow) ONCE and cache it. The PMK depends only on
+// passphrase+SSID, so it survives across (re)connects. Called before the scan so
+// becomeStation can use beginCached() and switch the RX to the EAPOL phase within the
+// AP's ~4s M1-retry window (inline PBKDF2 in becomeStation missed every M1).
+void ApfpvStation::ensurePmk() {
+    if (_pmkValid.load()) return;
+    auto c = MakeWpa2Crypto();
+    _pmkCache = c.pbkdf2_pmk(_params.passphrase,
+                             reinterpret_cast<const uint8_t*>(_params.ssid.data()),
+                             _params.ssid.size());
+    _pmkValid.store(true);
+}
+
+// UPLINK general-IP: CCMP-encrypt + TX an arbitrary IPv4 datagram (SSH, any TCP/UDP) the
+// VpnService TUN read from the OS. Same encrypt+TX-desc path as DHCP/RTP uplink.
+bool ApfpvStation::sendIpPacket(const uint8_t* ip, size_t len) {
+    if (!_wpa || !_wpa->ready() || !ip || len < 20) return false;
+    auto mpdu = _wpa->buildEncryptedData(ip, len);
+    if (mpdu.empty()) return false;
+    auto* dev = reinterpret_cast<RtlUsbAdapter*>(_dev);
+    std::vector<uint8_t> frame(40 + mpdu.size(), 0);          // 40 = 8812 TX desc
+    std::memcpy(frame.data() + 40, mpdu.data(), mpdu.size());
+    apfpv::FillStationTxDesc(frame.data(), (uint16_t)mpdu.size(), 40,
+                             0, apfpv::StationFrameKind::CcmpData, 0, 0x04);
+    return dev->sendStationFrameSync(frame.data(), frame.size());
+}
+
+uint32_t ApfpvStation::leaseIp() const       { return _dhcp ? _dhcp->lease().ip : 0; }
+uint32_t ApfpvStation::leaseServerIp() const { return _dhcp ? _dhcp->lease().server : 0; }
+
+// Minimal TCP/HTTP GET over the link — proves the dongle carries general TCP (so SSH/REST work).
+std::string ApfpvStation::httpGet(uint32_t dstIp, uint16_t port, const std::string& path, int timeoutMs) {
+    if (!_rx || !_dhcp || !_dhcp->lease().valid) return "";
+    using namespace std::chrono;
+    uint32_t srcIp = _dhcp->lease().ip;
+    const uint16_t sport = 0xC350;                       // ephemeral source port 50000
+    { std::lock_guard<std::mutex> lk(_ipQMtx); _ipQ.clear(); }
+    _ipCapture.store(true);
+    _rx->setIpSink([this](const uint8_t* p, size_t n){
+        if (!_ipCapture.load()) return;
+        std::lock_guard<std::mutex> lk(_ipQMtx); _ipQ.emplace_back(p, p + n);
+    });
+    auto poll = [&](uint8_t wantFlags, uint32_t& srvSeqOut, std::string& data)->bool {
+        auto t0 = steady_clock::now();
+        while (steady_clock::now() - t0 < milliseconds(timeoutMs)) {
+            std::vector<std::vector<uint8_t>> batch;
+            { std::lock_guard<std::mutex> lk(_ipQMtx); batch.swap(_ipQ); }
+            for (auto& pk : batch) {
+                if (pk.size() < 40 || pk[9] != 6) continue;                 // IPv4 TCP
+                uint32_t s = ((uint32_t)pk[12]<<24)|((uint32_t)pk[13]<<16)|((uint32_t)pk[14]<<8)|pk[15];
+                if (s != dstIp) continue;
+                size_t ihl = (size_t)(pk[0]&0xf)*4; if (pk.size() < ihl + 20) continue;
+                const uint8_t* t = pk.data() + ihl;
+                if ((uint16_t)((t[0]<<8)|t[1]) != port) continue;           // src port = server
+                srvSeqOut = ((uint32_t)t[4]<<24)|((uint32_t)t[5]<<16)|((uint32_t)t[6]<<8)|t[7];
+                size_t toff = (size_t)(t[12]>>4)*4;
+                if (pk.size() > ihl + toff) data.append((const char*)(t + toff), pk.size() - ihl - toff);
+                if (t[13] & wantFlags) return true;
+            }
+            std::this_thread::sleep_for(milliseconds(10));
+        }
+        return false;
+    };
+    uint32_t srvSeq = 0, seq = 1000; std::string resp, ignore;
+    auto syn = buildTcp(srcIp, dstIp, sport, port, seq, 0, 0x02, nullptr, 0);        // SYN
+    sendIpPacket(syn.data(), syn.size());
+    if (!poll(0x12, srvSeq, ignore)) { _ipCapture.store(false); return ""; }         // wait SYN|ACK
+    seq = 1001;
+    std::string req = "GET " + path + " HTTP/1.0\r\nHost: vtx\r\n\r\n";
+    auto get = buildTcp(srcIp, dstIp, sport, port, seq, srvSeq + 1, 0x18,            // ACK + GET (PSH|ACK)
+                        (const uint8_t*)req.data(), req.size());
+    sendIpPacket(get.data(), get.size());
+    poll(0x01, srvSeq, resp);                                                        // gather until FIN/timeout
+    auto fin = buildTcp(srcIp, dstIp, sport, port, seq + (uint32_t)req.size(), srvSeq + 1, 0x11, nullptr, 0);
+    sendIpPacket(fin.data(), fin.size());                                            // FIN|ACK (polite close)
+    _ipCapture.store(false);
+    return resp;
+}
+
+static uint16_t ipChecksum(const uint8_t* p, size_t n) {
+    uint32_t s = 0;
+    for (size_t i = 0; i + 1 < n; i += 2) s += (uint32_t)((p[i] << 8) | p[i+1]);
+    if (n & 1) s += (uint32_t)(p[n-1] << 8);
+    while (s >> 16) s = (s & 0xffff) + (s >> 16);
+    return (uint16_t)~s;
+}
+// Wrap a BOOTP/DHCP payload in IPv4+UDP (0.0.0.0:68 -> 255.255.255.255:67). The ApfpvDhcp
+// emits only the BOOTP message (RX strips IP/UDP too), but buildEncryptedData expects a
+// COMPLETE IPv4 packet — without these headers the AP's IP stack sees "IP version 0" and
+// drops the DISCOVER before dnsmasq, so no lease is ever offered.
+static std::vector<uint8_t> wrapDhcpUdpIp(const uint8_t* bootp, size_t blen) {
+    size_t udpLen = 8 + blen, ipLen = 20 + udpLen;
+    std::vector<uint8_t> p(ipLen, 0);
+    p[0]=0x45; p[2]=(uint8_t)(ipLen>>8); p[3]=(uint8_t)(ipLen&0xff);  // ver4/ihl5, total len
+    p[8]=64; p[9]=17;                                   // ttl=64, proto=UDP (src stays 0.0.0.0)
+    p[16]=p[17]=p[18]=p[19]=0xff;                       // dst = 255.255.255.255
+    uint16_t ick = ipChecksum(p.data(), 20);
+    p[10]=(uint8_t)(ick>>8); p[11]=(uint8_t)(ick&0xff);
+    p[21]=68; p[23]=67;                                 // UDP sport 68, dport 67
+    p[24]=(uint8_t)(udpLen>>8); p[25]=(uint8_t)(udpLen&0xff);  // UDP len; checksum 0 (optional v4)
+    std::memcpy(p.data()+28, bootp, blen);
+    return p;
+}
+
+// Build an IPv4 + TCP segment (flags: SYN=0x02 ACK=0x10 PSH=0x08 FIN=0x01 RST=0x04).
+static std::vector<uint8_t> buildTcp(uint32_t srcIp, uint32_t dstIp, uint16_t sport, uint16_t dport,
+                                     uint32_t seq, uint32_t ack, uint8_t flags,
+                                     const uint8_t* payload, size_t plen) {
+    size_t tcpLen = 20 + plen, ipLen = 20 + tcpLen;
+    std::vector<uint8_t> p(ipLen, 0);
+    p[0]=0x45; p[2]=(uint8_t)(ipLen>>8); p[3]=(uint8_t)(ipLen&0xff); p[8]=64; p[9]=6;   // proto TCP
+    p[12]=(uint8_t)(srcIp>>24);p[13]=(uint8_t)(srcIp>>16);p[14]=(uint8_t)(srcIp>>8);p[15]=(uint8_t)srcIp;
+    p[16]=(uint8_t)(dstIp>>24);p[17]=(uint8_t)(dstIp>>16);p[18]=(uint8_t)(dstIp>>8);p[19]=(uint8_t)dstIp;
+    uint16_t ick = ipChecksum(p.data(), 20); p[10]=(uint8_t)(ick>>8); p[11]=(uint8_t)(ick&0xff);
+    uint8_t* t = p.data()+20;
+    t[0]=(uint8_t)(sport>>8);t[1]=(uint8_t)sport;t[2]=(uint8_t)(dport>>8);t[3]=(uint8_t)dport;
+    t[4]=(uint8_t)(seq>>24);t[5]=(uint8_t)(seq>>16);t[6]=(uint8_t)(seq>>8);t[7]=(uint8_t)seq;
+    t[8]=(uint8_t)(ack>>24);t[9]=(uint8_t)(ack>>16);t[10]=(uint8_t)(ack>>8);t[11]=(uint8_t)ack;
+    t[12]=0x50; t[13]=flags; t[14]=0xff; t[15]=0xff;       // data-offset 5, window 0xffff
+    if (plen) std::memcpy(t+20, payload, plen);
+    uint32_t s = ((srcIp>>16)&0xffff)+(srcIp&0xffff)+((dstIp>>16)&0xffff)+(dstIp&0xffff)+6u+(uint32_t)tcpLen;
+    for (size_t i=0;i+1<tcpLen;i+=2) s += (uint32_t)((t[i]<<8)|t[i+1]);
+    if (tcpLen&1) s += (uint32_t)(t[tcpLen-1]<<8);
+    while (s>>16) s=(s&0xffff)+(s>>16);
+    uint16_t ck=(uint16_t)~s; t[16]=(uint8_t)(ck>>8); t[17]=(uint8_t)(ck&0xff);
+    return p;
+}
+
 // The gated establishment chain (arm -> auth -> assoc -> WPA2 -> DHCP -> stream).
 // Returns true only on a held, streaming link. Used for both initial connect
 // AND each supervisor reconnect attempt.
@@ -111,14 +399,18 @@ bool ApfpvStation::runConnectChain() {
     auto& dev = *reinterpret_cast<RtlUsbAdapter*>(_dev);
     auto& rm  = *reinterpret_cast<RadioManagementModule*>(_rm);
     auto sendFrame = [&dev](const std::vector<uint8_t>& f) {
-        // Async-IO model (default): async TX completes via the SAME libusb event
-        // loop that drives the async RX URBs (kernel 88XXau model) -> RX and TX
-        // no longer fight over the event handler, so the auth/assoc actually
-        // radiates. Legacy DEVOURER_SYNC_IO uses a synchronous bulk-OUT (the async
-        // TX cannot complete without an event loop in that mode).
+        // Station TX coexisting with the kernel-tasklet async RX. libusb userspace
+        // cannot push a bulk-OUT while bulk-IN URBs are pending (WinUSB + USB/IP
+        // both serialise OUT behind INs, unlike the Linux kernel USB core), so a
+        // bare async send_packet times out (status 2, 0 bytes). sendStationFrameSync
+        // drains the RX pool, does the proven sync bulk-OUT, then re-arms RX fast
+        // enough to catch the AP's reply. DEVOURER_BARE_ASYNC_TX forces the old
+        // (broken) path for A/B; DEVOURER_SYNC_IO is the legacy all-sync mode.
+        if (std::getenv("DEVOURER_BARE_ASYNC_TX"))
+            return dev.send_packet(const_cast<uint8_t*>(f.data()), f.size());
         if (std::getenv("DEVOURER_SYNC_IO"))
             return dev.bulk_send_sync(const_cast<uint8_t*>(f.data()), f.size(), 200) == 0;
-        return dev.send_packet(const_cast<uint8_t*>(f.data()), f.size());
+        return dev.sendStationFrameSync(const_cast<uint8_t*>(f.data()), f.size());
     };
     StationMode sta(dev, rm, sendFrame);
     MacAddr self{}, bssid{};
@@ -142,10 +434,24 @@ bool ApfpvStation::runConnectChain() {
         StationMode* sp = &sta;
         auto dispatch = [sp, this](const Packet& pkt){
             _rxReady.store(true);
-            if (_rxPhase.load() == 1) { RxDeframe* rx = _rx.get(); if (rx) rx->onPacket(pkt); return; }
+            if (_rxPhase.load() == 1) {
+                const uint8_t* df = pkt.Data.data();
+                if (pkt.Data.size() >= 2) {
+                    uint16_t dfc = (uint16_t)(df[0] | (df[1] << 8));
+                    fprintf(stderr, "[disp1] fc=0x%04x type=%d sub=%d len=%zu\n",
+                            dfc, (dfc>>2)&3, (dfc>>4)&0xF, pkt.Data.size());
+                }
+                RxDeframe* rx = _rx.get(); if (rx) rx->onPacket(pkt); return;
+            }
             const uint8_t* f = pkt.Data.data(); size_t n = pkt.Data.size();
             if (n < 24) return;
             uint16_t fc = (uint16_t)(f[0] | (f[1] << 8));
+            if (((fc>>2)&3)==0 && n >= 30) {
+                uint8_t sub = (fc>>4)&0xF;
+                if (sub==0xB) fprintf(stderr, "[auth-resp]  status=%u\n", (unsigned)(f[28]|(f[29]<<8)));
+                if (sub==0x1) fprintf(stderr, "[assoc-resp] status=%u aid=0x%04x\n",
+                                      (unsigned)(f[26]|(f[27]<<8)), (unsigned)(f[28]|(f[29]<<8)));
+            }
             sp->onScanFrame(f, n);                  // beacons -> _scanResult
             std::string ss; ApInfo bi;
             if (ScanProbe::parseAnyBeacon(f, n, ss, bi) && !ss.empty()) {
@@ -200,6 +506,7 @@ bool ApfpvStation::runConnectChain() {
     bool bad = true; for (int i=0;i<6;i++){ if(self.b[i]!=0 && self.b[i]!=0xFF) bad=false; }
     if (bad) { self.b[0]=0x02; self.b[1]=0x11; self.b[2]=0x22;
                self.b[3]=0x33; self.b[4]=0x44; self.b[5]=0x55; }
+    ensurePmk();   // precompute the PBKDF2 PMK now (cached) so becomeStation is instant
 
     // DISCOVERY: scan beacons for the SSID -> BSSID + channel + negotiated RSN.
     // Removes the hardcoded-channel / empty-BSSID / fixed-cipher assumptions
@@ -216,18 +523,25 @@ bool ApfpvStation::runConnectChain() {
         set(State::Scanning);
         // Sweep beacons for the SSID -> BSSID + channel + negotiated RSN (now works:
         // the RX thread feeds frames while this thread hops channels).
-        ap = sta.scanForSsid(_params.ssid.c_str(), _params.channel, /*ms*/2000);
+        ap = sta.scanForSsid(_params.ssid.c_str(), _params.channel, /*ms*/300);
         SCANLOG("scan: \"%s\" found=%d ch=%d", _params.ssid.c_str(), ap.found?1:0, ap.channel);
         if (!ap.found) { set(State::FailNoAp); return false; }
         bssid.b = ap.bssid;
         _params.channel = ap.channel ? ap.channel : _params.channel;
         sta.setNegotiatedCipher(ScanProbe::chooseCipher(ap.pairwise),
                                 ap.rsnPresent ? ap.groupCipher : 0x000FAC04);
+        SCANLOG("CIPHERS: pairwise=0x%08x group=0x%08x (CCMP=0x000FAC04 TKIP=0x000FAC02)",
+                ScanProbe::chooseCipher(ap.pairwise), ap.rsnPresent ? ap.groupCipher : 0x000FAC04);
     }
 
+    sta.setPmf(_params.pmf);              // 802.11w RSN caps in the assoc-req (0 = off, no change)
     set(State::Arming);
     sta.setPhaseCb([this](int p){ set(p == 1 ? State::Authenticating : State::Associating); });
-    auto r = sta.runProbe(self, bssid, _params.ssid.c_str(), /*hold*/3);
+    // hold=0: return the instant assoc succeeds. The AP starts the 4-way (M1) immediately
+    // after assoc and only retries for ~4s; any hold here keeps the RX in the arm phase
+    // (data frames dropped) so M1 is missed. becomeStation must switch RX to the EAPOL
+    // phase ASAP. Link confirmation/deauth handling is the supervisor's job afterward.
+    auto r = sta.runProbe(self, bssid, _params.ssid.c_str(), /*hold*/0);
     SCANLOG("arm result: %d (0=GO 1=Deauth 2=NoAssocResp 3=TXFAIL_NoAuth 4=Error)", (int)r);
     switch (r) {
         case StationMode::Result::TXFAIL_NoAuthResp: set(State::FailTx);   return false;
@@ -241,13 +555,29 @@ bool ApfpvStation::runConnectChain() {
     Mac selfMac{}, bss{};
     std::copy(self.b.begin(), self.b.end(), selfMac.begin());
     std::copy(bssid.b.begin(), bssid.b.end(), bss.begin());
-    _wpa = std::make_unique<Wpa2Supplicant>(MakeWpa2Crypto(), sendFrame);
-    _wpa->begin(_params.passphrase, _params.ssid, selfMac, bss);
+    // EAPOL M2/M4 are DATA frames that need a TX descriptor. Auth/assoc add theirs in
+    // StationMode and DHCP adds its in dhcpSend, but BuildEapolKey returns the bare 802.11
+    // frame and sendFrame adds nothing — so M2's first 40B (the 802.11 header) were misread
+    // as the descriptor => garbled on air => the AP never advanced past PTKSTART. Wrap the
+    // supplicant's send to prepend the data TX descriptor (mirrors dhcpSend).
+    auto wpaSend = [&dev](const std::vector<uint8_t>& mpdu) -> bool {
+        std::vector<uint8_t> frame(40 + mpdu.size(), 0);          // 40 = 8812 TX desc
+        std::memcpy(frame.data() + 40, mpdu.data(), mpdu.size());
+        apfpv::FillStationTxDesc(frame.data(), (uint16_t)mpdu.size(), 40,
+                                 /*macid*/0, apfpv::StationFrameKind::CcmpData, /*raid*/0, /*rate*/0x04);
+        return dev.sendStationFrameSync(frame.data(), frame.size());
+    };
+    _wpa = std::make_unique<Wpa2Supplicant>(MakeWpa2Crypto(), wpaSend);
+    _wpa->setPmf(_params.pmf);                     // 802.11w: M2 RSN caps must match the assoc-req
+    ensurePmk();                                   // no-op if already cached
+    _wpa->beginCached(_pmkCache, selfMac, bss);    // INSTANT (no PBKDF2) -> RX switches to
+                                                   // the EAPOL phase in time to catch M1
 
     // Real (encrypted) DHCP send path — usable once keys are installed.
-    auto dhcpSend = [&](const std::vector<uint8_t>& ipDatagram) -> bool {
+    auto dhcpSend = [&](const std::vector<uint8_t>& bootp) -> bool {
         if (!_wpa || !_wpa->ready()) return false;
-        auto mpdu = _wpa->buildEncryptedData(ipDatagram.data(), ipDatagram.size());
+        auto full = wrapDhcpUdpIp(bootp.data(), bootp.size());   // BOOTP -> full IPv4/UDP packet
+        auto mpdu = _wpa->buildEncryptedData(full.data(), full.size());
         if (mpdu.empty()) return false;
         std::vector<uint8_t> frame(40 + mpdu.size(), 0);   // 40 = 8812 TX desc
         std::memcpy(frame.data()+40, mpdu.data(), mpdu.size());
@@ -265,10 +595,18 @@ bool ApfpvStation::runConnectChain() {
     _rx->setStation(this);
     { ApfpvDhcp* dh = _dhcp.get();
       _rx->setDhcpSink([dh](const uint8_t* b, size_t n){ dh->onBootpReply(b, n); }); }
+    if (_ipSink) _rx->setIpSink(_ipSink);   // general-IP downlink -> VpnService TUN (SSH etc.)
     // Switch the ALREADY-RUNNING RX thread to the streaming path — do NOT re-Init
     // (that blocks). EAPOL (handshake), DHCP replies, and RTP now route through
     // RxDeframe via the dispatch. The device is already tuned to the AP's channel.
     _rxPhase.store(1);
+    {
+        uint32_t r = dev.rtw_read32(0x0608);
+        fprintf(stderr, "[hs] RCR=0x%08x ADF=%d ACF=%d  FLT0mgmt=0x%04x FLT1ctl=0x%04x FLT2data=0x%04x  MSR=0x%02x\n",
+                r, (int)((r>>11)&1), (int)((r>>12)&1),
+                dev.rtw_read16(0x06A0), dev.rtw_read16(0x06A2), dev.rtw_read16(0x06A4),
+                dev.rtw_read8(0x0102));
+    }
 
     // Wait (bounded) for the 4-way handshake to install keys.
     {
@@ -280,18 +618,74 @@ bool ApfpvStation::runConnectChain() {
         }
     }
 
+    // ENCRYPT round-trip self-test: encrypt a dummy IPv4/UDP datagram, then decrypt it through
+    // the proven-standard decrypt path. roundtrip+match => our CCMP ENCRYPT is standard (so a
+    // dropped uplink is a framing/DHCP issue, not crypto); fail => the encrypt itself is wrong.
+    {
+        uint8_t tip[28] = {0x45,0,0,28, 0,0,0,0, 64,17,0,0, 192,168,250,9, 255,255,255,255,
+                           0,68,0,67,0,8,0,0};
+        auto e = _wpa->buildEncryptedData(tip, sizeof(tip));
+        std::vector<uint8_t> dpl;
+        bool rt = !e.empty() && _wpa->decryptData(e.data(), e.size(), dpl);
+        bool match = rt && dpl.size() >= 8 + sizeof(tip) && std::memcmp(dpl.data()+8, tip, sizeof(tip))==0;
+        fprintf(stderr, "[enc-selftest] roundtrip=%d match=%d encLen=%zu decLen=%zu\n",
+                (int)rt, (int)match, e.size(), dpl.size());
+    }
+
     // Keys installed -> DHCP (or static). For dynamic, wait briefly for the lease.
     set(State::Dhcp);
-    if (_params.staticIp) _dhcp->claimStatic_192_168_0_10();
+    if (_params.staticIp) _dhcp->claimStatic(_params.staticIp, _params.staticNetmask, _params.staticGateway);
     else {
-        _dhcp->start();
         using namespace std::chrono;
-        auto t0 = steady_clock::now();
+        _dhcp->start();                                            // initial DISCOVER
+        auto t0 = steady_clock::now(); auto lastTx = steady_clock::now();
         while (!_dhcp->lease().valid) {
-            if (steady_clock::now() - t0 > seconds(4)) break;
+            if (steady_clock::now() - t0 > seconds(8)) break;
+            // Retransmit the CURRENT pending message (DISCOVER, then REQUEST) every ~700ms:
+            // a single reply (OFFER or ACK) is easily missed in the RX re-arm gap after our
+            // sync TX, and we must retry the REQUEST (not restart DORA) to land the ACK.
+            if (steady_clock::now() - lastTx > milliseconds(700)) {
+                _dhcp->retransmit(); lastTx = steady_clock::now();
+            }
             std::this_thread::sleep_for(milliseconds(20));
         }
+        { uint32_t ip=_dhcp->lease().ip;
+          fprintf(stderr, "[dhcp] DORA done: valid=%d ip=%u.%u.%u.%u\n", (int)_dhcp->lease().valid,
+                  (ip>>24)&255,(ip>>16)&255,(ip>>8)&255,ip&255); }
         if (!_dhcp->lease().valid) _dhcp->claimStatic_192_168_0_10();  // fallback
+    }
+
+    // Gratuitous ARP: announce our leased IP<->MAC (broadcast) so peers can resolve our MAC
+    // WITHOUT sending an ARP request (we don't answer those yet). Without this, the VTX that
+    // unicasts RTP to our IP — and anything doing SSH/TCP to us — can't address us at L2.
+    if (_dhcp->lease().valid) {
+        uint32_t ip = _dhcp->lease().ip;
+        // Build the gratuitous ARP once; the supervisor re-announces it every ~2s so the AP's
+        // ARP entry for us never goes STALE (else unicast RTP stalls). In the real setup the LQ
+        // feedback to the VTX also keeps it fresh, but this works on any subnet.
+        _gratArp = [this, &dev, selfMac, ip]() {
+            if (!_wpa || !_wpa->ready()) return;
+            uint8_t arp[28] = {0,1, 8,0, 6,4, 0,1};
+            std::memcpy(arp+8, selfMac.data(), 6);
+            arp[14]=(ip>>24)&255; arp[15]=(ip>>16)&255; arp[16]=(ip>>8)&255; arp[17]=ip&255;
+            arp[24]=(ip>>24)&255; arp[25]=(ip>>16)&255; arp[26]=(ip>>8)&255; arp[27]=ip&255;
+            auto m = _wpa->buildEncryptedData(arp, 28, 0x0806);
+            if (m.empty()) return;
+            std::vector<uint8_t> fr(40 + m.size(), 0);
+            std::memcpy(fr.data()+40, m.data(), m.size());
+            apfpv::FillStationTxDesc(fr.data(), (uint16_t)m.size(), 40,
+                                     0, apfpv::StationFrameKind::CcmpData, 0, 0x04);
+            dev.sendStationFrameSync(fr.data(), fr.size());
+        };
+        for (int k=0;k<3;++k) _gratArp();                 // announce now
+        // Answer subsequent ARP requests for our IP (keeps the unicast video stream alive).
+        _rx->setArp(ip, [&dev](const std::vector<uint8_t>& mpdu){
+            std::vector<uint8_t> fr(40 + mpdu.size(), 0);
+            std::memcpy(fr.data()+40, mpdu.data(), mpdu.size());
+            apfpv::FillStationTxDesc(fr.data(), (uint16_t)mpdu.size(), 40,
+                                     0, apfpv::StationFrameKind::CcmpData, 0, 0x04);
+            dev.sendStationFrameSync(fr.data(), fr.size());
+        });
     }
 
     // mark link alive and go streaming
@@ -318,12 +712,14 @@ bool ApfpvStation::connect(const Params& p) {
 void ApfpvStation::supervisorLoop() {
     using namespace std::chrono;
     int backoff = _params.reconnectBackoffMs;
+    int gratTick = 0;
     while (_run.load()) {
         std::this_thread::sleep_for(milliseconds(100));
         State s = _state.load();
 
         if (s == State::Streaming) {
             backoff = _params.reconnectBackoffMs;   // reset backoff on healthy link
+            if (++gratTick >= 20) { gratTick = 0; if (_gratArp) _gratArp(); }  // re-announce ARP ~2s
             bool lost = _deauth.load();
             // RX-silence watchdog: no data/beacon for rxTimeoutMs => link gone.
             if (!lost && (nowMs() - _lastRxMs.load()) > _params.rxTimeoutMs) lost = true;

@@ -181,6 +181,10 @@ public:
   void ArmIQKOnNextChannelSet() { _needIQK = true; }
   void hw_var_rcr_config(uint32_t rcr);
   void SetMonitorMode();
+  /* The channel the radio is currently tuned to (set by set_channel_bwmode).
+   * Used by StationMode to pick a band-correct mgmt TX rate: 5 GHz (ch>14)
+   * has no CCK, so auth/assoc must go at OFDM, like the kernel. */
+  uint8_t current_channel() const { return _currentChannel; }
   void set_channel_bwmode(uint8_t channel, uint8_t channel_offset,
                           ChannelWidth_t bwmode);
   void phy_set_rf_reg(RfPath eRFPath, uint16_t RegAddr, uint32_t BitMask,
@@ -212,6 +216,9 @@ private:
                                     uint8_t ChnlOffsetOf80MHz,
                                     uint8_t CenterFrequencyIndex1);
   void phy_SwChnlAndSetBwMode8812();
+  /* LC (VCO/LC-tank) calibration — port of kernel _phy_lc_calibrate_8812a.
+   * Run after the IQK; the devourer previously skipped it. */
+  void phy_lc_calibrate_8812a();
   uint32_t phy_RFSerialRead(RfPath eRFPath, uint32_t Offset);
   void phy_RFSerialWrite(RfPath eRFPath, uint32_t Offset, uint32_t Data);
   void phy_SetRFEReg8812(BandType Band);

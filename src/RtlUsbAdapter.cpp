@@ -14,6 +14,9 @@
 #include <iostream>
 #include <thread>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <condition_variable>
 
 using namespace std::chrono_literals;
 
@@ -546,6 +549,40 @@ int RtlUsbAdapter::bulk_send_sync(uint8_t *packet, size_t length,
 
 int RtlUsbAdapter::bulk_send_sync_ep(uint8_t ep, uint8_t *packet, size_t length,
                                      int timeout_ms) {
+  /* One-time chip-state dump at the FIRST station TX, to compare the live
+   * TX-path state against the kernel's known-good values (CR=0x06ff,
+   * TXPAUSE=0x00). The usbmon "final write" can mislead; this reads the chip. */
+  static bool sta_first_dump = true;
+  if (sta_first_dump) {
+    sta_first_dump = false;
+    try {
+      uint16_t cr      = rtw_read16(0x0100);
+      uint8_t  txpause = rtw_read8(0x0522);
+      uint32_t fwhw    = rtw_read32(0x0420);
+      uint16_t trxdma  = rtw_read16(0x010C);
+      uint8_t  ant     = rtw_read8(0x0808);   /* RX/TX antenna sel (IQK zeroes it) */
+      uint32_t bbcca   = rtw_read32(0x0838);  /* CCA / OFDM-TX path (IQK sets 0xc) */
+      uint8_t  cckrx   = rtw_read8(0x0a07);   /* CCK RX path (IQK sets 0xf) */
+      uint32_t rrsr    = rtw_read32(0x0604);
+      uint32_t bbtxA   = rtw_read32(0x0c04);  /* path-A TX path enable (BB) */
+      uint32_t bbtxB   = rtw_read32(0x0e04);  /* path-B TX path enable (BB) */
+      _logger->info("STA-pre-TX/1 CR=0x{:04x} TXPAUSE=0x{:02x}", cr, txpause);
+      _logger->info("STA-pre-TX/2 FWHW_TXQ=0x{:08x} TRXDMA=0x{:04x}", fwhw, trxdma);
+      _logger->info("STA-pre-TX/3 ANT808=0x{:02x} CCA838=0x{:08x}", ant, bbcca);
+      _logger->info("STA-pre-TX/4 CCKRXa07=0x{:02x} RRSR=0x{:08x}", cckrx, rrsr);
+      _logger->info("STA-pre-TX/5 BBtxA_c04=0x{:08x} BBtxB_e04=0x{:08x}", bbtxA, bbtxB);
+      /* RFE (RF front-end / antenna TR switch) in BB Page C. Expect 0x00508242
+       * (the 8812 BB-table value) once the post-IQK restore is in. 0 = the IQK
+       * zeroed it = the on-air-silence bug. Save/restore the page so the TX is
+       * unaffected. */
+      uint32_t pc  = rtw_read32(0x082c);
+      rtw_write32(0x082c, pc & ~0x80000000u);
+      uint32_t rfeA = rtw_read32(0x0cb8);
+      uint32_t rfeB = rtw_read32(0x0eb8);
+      rtw_write32(0x082c, pc);
+      _logger->info("STA-pre-TX/6 RFE_cb8/eb8(PageC)=0x{:08x}/0x{:08x}", rfeA, rfeB);
+    } catch (...) {}
+  }
   /* No libusb_clear_halt here. rtw88_8814au's usbmon shows the first bulk
    * OUT is preceded by 0 CLEAR_FEATUREs; later CLEAR_FEATUREs happen during
    * normal TX-queue operation, not the per-send hot path. Resetting the
@@ -562,10 +599,35 @@ int RtlUsbAdapter::bulk_send_sync_ep(uint8_t ep, uint8_t *packet, size_t length,
     return rc;
   }
   _logger->info("bulk_send EP {} OK {} bytes", (int)ep, actual);
+  /* DECISIVE: did the frame leave the TX FIFO? Read REG_TXPKT_EMPTY (0x041A)
+   * before-ish (the dump read it at sta state) and now after a settle. If the
+   * mgmt/high queue empties, the chip transmitted/drained it (=> radiation/RF or
+   * AP issue). If it stays non-empty, the TX DMA never fired (=> chip TX gating).
+   * Also REG_TXFF_STATUS (0x0418) + the per-queue free-page. One-time only. */
+  static bool sta_post_check = true;
+  if (sta_post_check) {
+    sta_post_check = false;
+    try {
+      uint16_t e0 = rtw_read16(0x041A);
+      std::this_thread::sleep_for(std::chrono::milliseconds(8));
+      uint16_t e1 = rtw_read16(0x041A);
+      uint32_t hisr = rtw_read32(0x00b4);   /* HISR — TX-OK interrupt flags */
+      _logger->info("STA-post-TX TXPKT_EMPTY 0x41a: {:#06x}->{:#06x}  HISR(0xb4)={:#010x}",
+                    e0, e1, hisr);
+    } catch (...) {}
+  }
   return actual;
 }
 
 // ---- Kernel-style async RX (APFPV station path) ---------------------------
+// Ported from the Linux 88XXau usb_read_port_complete / usb_recv_tasklet split
+// (os_dep/linux/usb_ops_linux.c). The completion CALLBACK must do *minimal* work
+// and resubmit the URB IMMEDIATELY, so the bulk-IN URB pool is always refilled
+// and the shared libusb event loop never stalls (a stalled loop = RX gaps AND
+// the async bulk-OUT TX never completes -> auth/assoc time out). The expensive
+// recvbuf2recvframe parse + dispatch run on a SEPARATE worker thread (the kernel
+// tasklet), NOT inline in the callback. This is the fix for "2 beacons received,
+// 0 auth responses, TX status-2 timeout".
 struct RtlUsbAdapter::AsyncRxState {
   Logger_t logger;
   std::function<void(const Packet &)> proc;
@@ -573,23 +635,69 @@ struct RtlUsbAdapter::AsyncRxState {
   std::atomic<int> inflight{0};
   std::vector<libusb_transfer *> transfers;
   std::vector<std::vector<uint8_t>> buffers;
+  // recv_tasklet queue: the URB callback pushes a raw recvbuf copy here and
+  // resubmits; the worker pops + parses off the event-loop thread.
+  std::mutex qMtx;
+  std::condition_variable qCv;
+  std::deque<std::vector<uint8_t>> queue;
+  std::thread worker;
+  std::atomic<uint64_t> rxBufs{0};        // recvbufs handed to the worker (diag)
+  // While paused, the callback retires URBs WITHOUT resubmitting, so the bulk-IN
+  // pipe drains and a bulk-OUT TX can go (libusb userspace serialises OUT behind
+  // pending INs on both WinUSB and USB/IP — unlike the Linux kernel USB core).
+  std::atomic<bool> paused{false};
+  // Per-transfer ownership: true = in flight (owned by libusb), false = retired
+  // (owned by us, safe to resubmit). Index-parallel to `transfers`. This is the
+  // source of truth for "may I submit transfers[i]" and replaces the racy reliance
+  // on the aggregate `inflight` counter (which silently drifted under double-submit).
+  std::vector<std::unique_ptr<std::atomic<bool>>> submitted;
+  libusb_context *ctx{nullptr};   // for actively pumping events during the drain
 };
+
+// usb_recv_tasklet equivalent: one persistent FrameParser drains the queue and
+// dispatches frames. Off the libusb event thread, so a slow consumer never
+// stalls URB refill / TX completion.
+static void apfpv_rx_worker(RtlUsbAdapter::AsyncRxState *st) {
+  FrameParser fp{st->logger};
+  for (;;) {
+    std::vector<uint8_t> buf;
+    {
+      std::unique_lock<std::mutex> lk(st->qMtx);
+      st->qCv.wait(lk, [st] { return !st->queue.empty() || !st->running.load(); });
+      if (!st->running.load() && st->queue.empty()) break;
+      buf = std::move(st->queue.front());
+      st->queue.pop_front();
+    }
+    try {
+      auto pkts = fp.recvbuf2recvframe(std::span<uint8_t>{buf.data(), buf.size()});
+      for (auto &p : pkts) st->proc(p);
+    } catch (...) {}
+  }
+}
 
 static void LIBUSB_CALL apfpv_async_rx_cb(libusb_transfer *xfer) {
   auto *st = static_cast<RtlUsbAdapter::AsyncRxState *>(xfer->user_data);
   if (xfer->status == LIBUSB_TRANSFER_COMPLETED && xfer->actual_length > 0) {
-    try {
-      FrameParser fp{st->logger};
-      auto pkts = fp.recvbuf2recvframe(
-          std::span<uint8_t>{xfer->buffer, (size_t)xfer->actual_length});
-      for (auto &p : pkts) st->proc(p);
-    } catch (...) {}
+    // MINIMAL inline work (rtw_enqueue_recvbuf): copy the recvbuf, hand it to the
+    // worker, then fall through to resubmit IMMEDIATELY. No parsing here.
+    {
+      std::lock_guard<std::mutex> lk(st->qMtx);
+      st->queue.emplace_back(xfer->buffer, xfer->buffer + xfer->actual_length);
+    }
+    st->rxBufs.fetch_add(1);
+    st->qCv.notify_one();
   }
   bool fatal = (xfer->status == LIBUSB_TRANSFER_CANCELLED ||
                 xfer->status == LIBUSB_TRANSFER_NO_DEVICE);
-  if (st->running.load() && !fatal && libusb_submit_transfer(xfer) == 0)
-    return;                       // re-queued, still in flight
-  st->inflight.fetch_sub(1);      // retired this URB
+  size_t idx = (size_t)-1;
+  for (size_t i = 0; i < st->transfers.size(); ++i)
+    if (st->transfers[i] == xfer) { idx = i; break; }
+  if (st->running.load() && !st->paused.load() && !fatal &&
+      libusb_submit_transfer(xfer) == 0)
+    return;                       // re-queued, flag stays true, still in flight
+  if (idx != (size_t)-1 && idx < st->submitted.size())
+    st->submitted[idx]->store(false, std::memory_order_release);
+  st->inflight.fetch_sub(1);      // retired this URB (cancelled / paused / fatal)
 }
 
 void RtlUsbAdapter::startAsyncRx(std::function<void(const Packet &)> processor,
@@ -599,19 +707,30 @@ void RtlUsbAdapter::startAsyncRx(std::function<void(const Packet &)> processor,
   st->logger = _logger;
   st->proc = std::move(processor);
   st->running.store(true);
+  st->worker = std::thread(apfpv_rx_worker, st.get());   // start the recv_tasklet
+  // Native USB: 0 = no timeout (kernel model). Over WSL USB/IP an always-pending
+  // IN URB blocks the OUT URB, so DEVOURER_RX_URB_TO (ms) lets the IN URBs cycle.
+  unsigned urbTo = 0;
+  if (const char *e = std::getenv("DEVOURER_RX_URB_TO")) urbTo = (unsigned)std::atoi(e);
+  st->ctx = *_usbCtx;                       // capture for the event-pump drain
   st->buffers.resize(numUrbs);
   st->transfers.reserve(numUrbs);
+  st->submitted.reserve(numUrbs);
   for (int i = 0; i < numUrbs; ++i) {
     st->buffers[i].resize(16 * 1024);
     libusb_transfer *t = libusb_alloc_transfer(0);
     libusb_fill_bulk_transfer(t, _dev_handle, _bulk_in_ep, st->buffers[i].data(),
                               (int)st->buffers[i].size(), apfpv_async_rx_cb,
-                              st.get(), 0 /* no timeout */);
+                              st.get(), urbTo);
     st->transfers.push_back(t);
-    if (libusb_submit_transfer(t) == 0) st->inflight.fetch_add(1);
+    st->submitted.push_back(std::make_unique<std::atomic<bool>>(false));
+    if (libusb_submit_transfer(t) == 0) {
+      st->submitted[i]->store(true, std::memory_order_release);
+      st->inflight.fetch_add(1);
+    }
   }
   _asyncRx = st;
-  _logger->info("async RX: {} URBs in flight", st->inflight.load());
+  _logger->info("async RX: {} URBs in flight (+recv worker)", st->inflight.load());
 }
 
 void RtlUsbAdapter::stopAsyncRx() {
@@ -621,8 +740,127 @@ void RtlUsbAdapter::stopAsyncRx() {
   for (auto *t : st->transfers) libusb_cancel_transfer(t);
   for (int i = 0; i < 200 && st->inflight.load() > 0; ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  st->qCv.notify_all();                       // wake the worker so it can exit
+  if (st->worker.joinable()) st->worker.join();
   for (auto *t : st->transfers) libusb_free_transfer(t);
   _asyncRx.reset();
+}
+
+// Drain the bulk-IN URB pool so a bulk-OUT TX can go (see AsyncRxState::paused).
+// Cancels the in-flight RX URBs and waits for them to retire. The recv worker +
+// queue are untouched, so buffers already received are still parsed.
+void RtlUsbAdapter::pauseAsyncRx() {
+  auto st = _asyncRx;
+  if (!st) return;
+  // Tell the external event thread to YIELD: otherwise it contends the libusb event
+  // lock with our drain pump below + the cal's synchronous control reads, leaving an IN
+  // pending and corrupting/serializing those reads (the daemon-vs-direct-call race).
+  if (_rxQuiesce) _rxQuiesce->store(true, std::memory_order_release);
+  st->paused.store(true);
+  for (auto *t : st->transfers) libusb_cancel_transfer(t);
+  // Actively pump events so the CANCELLED completions are reaped HERE — don't rely
+  // on the dedicated event thread being scheduled in time (that race leaves an IN
+  // pending and the OUT serializes behind it -> status=2 timeout). Bounded; falls
+  // back to sleeping only if no ctx was wired.
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
+  while (st->inflight.load() > 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    if (st->ctx) { struct timeval tv { 0, 1000 }; libusb_handle_events_timeout(st->ctx, &tv); }
+    else std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+
+// Re-arm the bulk-IN URB pool after a TX. Resubmits every URB in the pool.
+void RtlUsbAdapter::resumeAsyncRx() {
+  auto st = _asyncRx;
+  if (!st) return;
+  st->paused.store(false);
+  for (size_t i = 0; i < st->transfers.size(); ++i) {
+    bool expected = false;
+    if (!st->submitted[i]->compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel))
+      continue;                                  // still in flight — never double-submit
+    if (libusb_submit_transfer(st->transfers[i]) == 0)
+      st->inflight.fetch_add(1);
+    else
+      st->submitted[i]->store(false, std::memory_order_release);
+  }
+  if (_rxQuiesce) _rxQuiesce->store(false, std::memory_order_release);  // event thread resumes
+}
+
+// Station TX that coexists with the kernel-tasklet async RX. libusb userspace
+// can't push a bulk-OUT while bulk-IN URBs are pending (WinUSB + USB/IP both
+// serialise OUT behind INs), so: drain the RX pool, do the proven sync bulk-OUT,
+// then immediately re-arm RX (fast, so the AP's reply that follows is caught).
+bool RtlUsbAdapter::sendStationFrameSync(uint8_t *data, size_t len) {
+  // Recover a possibly-halted/stalled TX EP before EACH station TX. A NAK'd or
+  // failed bulk-OUT can leave the EP stalled so every subsequent OUT times out
+  // (status=2) — the FailTx wedge. send_packet only clears it on the very first
+  // send. clear_halt resets the data toggle on BOTH host + device so it stays in
+  // sync (and the prior station TX has already completed before we get here).
+  // *** clear_halt is OFF by default — it was the root cause of on-air silence. ***
+  // It was added to recover the WSL/vhci "FailTx wedge" (status=2 bulk-OUT), but
+  // clear_halt resets the EP/data-toggle mid-path and DISRUPTS the real transmission:
+  // the MAC drains the FIFO (TXPKT_EMPTY=0xfff) yet the frame never goes on-air. PROVEN
+  // on native Windows against the OnePlus AP's own hostapd RX log — WITH clear_halt the
+  // auth never reaches the AP (0 frames over 22s while foreign frames were logged);
+  // WITHOUT it the connect reaches Handshaking (auth+assoc OK). The beacon injector never
+  // clear_halt'd and always radiated (-52 dBm). Opt-in via DEVOURER_TX_HALT_CLR for the
+  // WSL/vhci wedge case only.
+  if (std::getenv("DEVOURER_TX_HALT_CLR")) {
+    uint8_t ep = 0x02;
+    if (const char *e = std::getenv("DEVOURER_TX_EP")) ep = (uint8_t)std::strtoul(e, nullptr, 0);
+    else if (!_bulk_out_eps.empty()) ep = _bulk_out_eps[0];
+    libusb_clear_halt(_dev_handle, ep);
+  }
+  if (!std::getenv("DEVOURER_TX_USE_PAUSE")) {
+    // DEFAULT (validated): concurrent IN/OUT exactly like the kernel USB core — do NOT
+    // cancel the RX URBs, so the AP's auth/assoc reply (which arrives ~1ms after our TX)
+    // is caught on the still-live RX. The per-TX clear_halt above is what keeps the OUT
+    // from wedging (status=2 timeout) behind the pending INs — without it this path
+    // wedged, which is why RX was historically paused. With both together the devourer
+    // reaches Associating[PASS] on WSL-vhci (the worst-case transport). The legacy
+    // drain-RX-then-TX path is still available via DEVOURER_TX_USE_PAUSE.
+    bool ok = send_packet(data, len);
+    // ACK-DRIVEN (kernel-style) instead of a blind sleep: watch the chip confirm the frame
+    // left the TX FIFO via REG_TXPKT_EMPTY (0x041A). Logs the drain so a SILENT run is
+    // diagnosable — FIFO never empties => chip gated the TX (no radiation, a concurrency/
+    // chip problem) vs FIFO drains => frame went out (an RF/AP problem). Bounded ~40ms.
+    if (!std::getenv("DEVOURER_TX_BLIND")) {
+      uint16_t e0 = 0, e = 0;
+      try { e0 = rtw_read16(0x041A); } catch (...) {}
+      auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(40);
+      int settled = 0;
+      e = e0;
+      do {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        uint16_t cur = e;
+        try { cur = rtw_read16(0x041A); } catch (...) { break; }
+        if (cur == e) { if (++settled >= 3) break; } else { settled = 0; e = cur; }
+      } while (std::chrono::steady_clock::now() < deadline);
+      _logger->info("STA-TX ack: TXPKT_EMPTY 0x41a {:#06x}->settled {:#06x}", e0, e);
+      return ok;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    return ok;
+  }
+  bool hadRx = (_asyncRx != nullptr) && !_asyncRx->paused.load();
+  if (hadRx) pauseAsyncRx();
+  bool ok;
+  if (std::getenv("DEVOURER_STA_SYNC_TX")) {
+    int rc = bulk_send_sync_ep(0x02, data, len, 200);
+    ok = (rc == (int)len);        // bulk_send_sync_ep returns bytes sent, or <0
+  } else {
+    // ASYNC submit path — the SAME path the beacon injector uses. It sets
+    // LIBUSB_TRANSFER_ADD_ZERO_PACKET and does NOT wedge after the first TX the way
+    // the sync libusb_bulk_transfer does (which returns -7/TIMEOUT on every send
+    // after the first). Wait briefly for the OUT + the MAC TX/retry to complete
+    // before re-arming the RX so the AP's reply is still caught.
+    ok = send_packet(data, len);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  if (hadRx) resumeAsyncRx();
+  return ok;
 }
 
 void RtlUsbAdapter::phy_set_bb_reg(uint16_t regAddr, uint32_t bitMask,

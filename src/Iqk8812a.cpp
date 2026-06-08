@@ -638,5 +638,13 @@ void Iqk8812a::Calibrate(uint8_t channel, BandType band, bool is_recovery) {
   _device.phy_set_bb_reg(0x82c, kMaskBit31, 0x0); /* Page C */
   RestoreMacBb(backup_macbb_reg, MACBB_backup, kMacBbRegNum);
 
+  /* ConfigureMac() paused all TX queues (REG_TXPAUSE 0x522 = 0x3f) for the
+   * calibration. RestoreMacBb restores the backed-up 0x520 dword, but that backup
+   * was taken from a chip that may already have had 0x522 = 0x3f (a prior IQK),
+   * so the restore is NOT guaranteed to release the queues. Clear it explicitly so
+   * NO TX path (station, beacon, monitor) can inherit a paused TX engine — the
+   * "MAC drains the FIFO but nothing radiates" defect. */
+  _device.rtw_write8(0x0522, 0x00);
+
   _logger->info("Iqk8812a::Calibrate done (channel={})", unsigned(channel));
 }

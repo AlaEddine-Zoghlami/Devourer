@@ -1,7 +1,8 @@
 cmake_minimum_required(VERSION 3.15)
 
-# Set the toolchain file for vcpkg on Windows.
-if(WIN32)
+# Set the toolchain file for vcpkg on Windows ONLY if vcpkg is actually present.
+# (MSYS2/MinGW builds use pkg-config directly and must skip this.)
+if(WIN32 AND DEFINED ENV{VCPKG_ROOT} AND NOT "$ENV{VCPKG_ROOT}" STREQUAL "")
     set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
 endif()
 
@@ -83,6 +84,8 @@ add_library(WiFiDriver
     src/Dot11Frames.h
     src/Wpa2Supplicant.cpp
     src/Wpa2Supplicant.h
+    src/Wpa2Authenticator.cpp
+    src/Wpa2Authenticator.h
     src/Wpa2Crypto.cpp
     src/Wpa2Crypto.h
     src/ApfpvDhcp.cpp
@@ -99,6 +102,8 @@ add_library(WiFiDriver
     src/crypto/Sha1Hmac.h
     src/crypto/AesCcm.cpp
     src/crypto/AesCcm.h
+    src/crypto/AesCmac.cpp
+    src/crypto/AesCmac.h
     src/registry_priv.h
 )
 
@@ -106,6 +111,11 @@ target_compile_features(WiFiDriver PUBLIC cxx_std_20)
 
 # Link WiFiDriver with libusb as found via pkg-config.
 target_link_libraries(WiFiDriver PUBLIC PkgConfig::libusb)
+# Windows (MSYS2/MinGW): the LQ/RTP/DHCP socket code needs winsock.
+if(WIN32)
+    target_link_libraries(WiFiDriver PUBLIC ws2_32)   # winsock (LQ/RTP/DHCP/relay sockets)
+    target_link_libraries(WiFiDriver PUBLIC bcrypt)    # CNG BCryptGenRandom (secure SNonce)
+endif()
 
 target_include_directories(WiFiDriver PUBLIC hal)
 target_include_directories(WiFiDriver PUBLIC hal/phydm/rtl8814a)
@@ -124,3 +134,7 @@ target_link_libraries(WiFiDriverTxDemo PUBLIC WiFiDriver PRIVATE PkgConfig::libu
 # APFPV ACK-survival probe (Linux laptop test target — run BEFORE Android)
 add_executable(ApfpvProbe demo/apfpv_probe.cpp)
 target_link_libraries(ApfpvProbe PUBLIC WiFiDriver PRIVATE PkgConfig::libusb)
+
+# APFPV behavior compliance suite (scan/connect/reconnect/create-ap)
+add_executable(ApfpvCompliance demo/apfpv_compliance.cpp)
+target_link_libraries(ApfpvCompliance PUBLIC WiFiDriver PRIVATE PkgConfig::libusb)

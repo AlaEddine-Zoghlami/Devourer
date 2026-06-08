@@ -69,6 +69,15 @@ public:
       std::make_shared<std::atomic<bool>>(false);
   struct AsyncRxState;                       // defined in the .cpp
   std::shared_ptr<AsyncRxState> _asyncRx;   // async RX URB pool (shared across copies)
+  // libusb context for the event-pump drain in pauseAsyncRx. shared_ptr so it
+  // survives RtlUsbAdapter value-copies (same pattern as _busMtx / _asyncRx).
+  std::shared_ptr<libusb_context*> _usbCtx = std::make_shared<libusb_context*>(nullptr);
+  void setUsbContext(libusb_context *c) { *_usbCtx = c; }
+  // Set true while RX is paused/draining so the EXTERNAL libusb event thread YIELDS
+  // instead of contending the event lock with pauseAsyncRx's own drain pump and the
+  // cal's synchronous control reads (the daemon-vs-direct-call serialization fix).
+  std::shared_ptr<std::atomic<bool>> _rxQuiesce;
+  void setQuiesceFlag(std::shared_ptr<std::atomic<bool>> q) { _rxQuiesce = std::move(q); }
 private:
 
 public:
@@ -132,6 +141,10 @@ public:
   struct AsyncRxState;
   void startAsyncRx(std::function<void(const Packet &)> processor, int numUrbs = 8);
   void stopAsyncRx();
+  // Coexist TX with the async RX pool: drain RX URBs, sync-TX, re-arm RX.
+  void pauseAsyncRx();
+  void resumeAsyncRx();
+  bool sendStationFrameSync(uint8_t *data, size_t len);
 
   void rtl8812au_hw_reset();
   void _8051Reset8812();

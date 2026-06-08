@@ -8,6 +8,7 @@
 #include <memory>
 #include <chrono>
 #include <mutex>
+#include <vector>
 #include <set>
 #include "ScanProbe.h"
 namespace apfpv {
@@ -32,7 +33,12 @@ public:
     using OnStateFn = std::function<void(State)>;
     struct Params { int channel=40; int bandwidth=20; std::string ssid="OpenIPC";
                     std::string passphrase="12345678"; bool lqFeedback=true;
-                    bool staticIp=false;
+                    // Static-IP option: staticIp != 0 -> SKIP DHCP and bind this IP (host byte
+                    // order, e.g. 0xC0A8000A = 192.168.0.10). netmask 0 -> /24, gateway 0 -> subnet .1.
+                    uint32_t staticIp=0, staticNetmask=0, staticGateway=0;
+                    // 802.11w PMF: 0=off, 1=capable (MFPC, DEFAULT — modern + verified to still
+                    // associate with non-PMF APs), 2=required (MFPC+MFPR). RSN caps in assoc-req+M2.
+                    int  pmf=1;
                     // discovery: if scan=true we find BSSID+channel+cipher via
                     // beacons (security+discovery parity with wpa_supplicant);
                     // channel above is the starting hint / fallback.
@@ -56,6 +62,17 @@ public:
     ~ApfpvStation();
     bool connect(const Params& p);   // runs the chain + starts the supervisor
     void disconnect();               // stops supervisor + tears down
+    // GENERAL-IP BRIDGE (for an Android VpnService TUN). setIpSink: downlink — receives the
+    // full decrypted IPv4 packet (SSH / any TCP+UDP), making the dongle a full L3 interface
+    // (not RTP-only). sendIpPacket: uplink — CCMP-encrypts + TXes an arbitrary IPv4 datagram.
+    void setIpSink(OnRtpFn fn) { _ipSink = std::move(fn); }
+    bool sendIpPacket(const uint8_t* ip, size_t len);
+    // Minimal TCP/HTTP client over the link — PROVES the dongle carries general TCP, so SSH
+    // and REST/HTTP (same transport) work over it. Real SYN/SYN-ACK/ACK + "GET <path>" to
+    // dstIp:port; returns the response (empty on failure). Blocking; call after Streaming.
+    std::string httpGet(uint32_t dstIp, uint16_t port, const std::string& path, int timeoutMs = 4000);
+    uint32_t leaseIp() const;       // our DHCP IP (0 if none)
+    uint32_t leaseServerIp() const; // DHCP server / gateway (the VTX analog)
 
     // All-SSID RF scan for the UI picker. Channel-hops the APFPV/5GHz/2.4 set,
     // parses every beacon, and calls onAp(ssid, info) once per NEW SSID as it is
@@ -74,6 +91,16 @@ public:
     void startBeaconCal(const std::string& ssid, int channel, int txIndex);
     void stopBeaconCal();
 
+    // ---- AP MODE (SoftAP) — ⚠️ NOT READY / WORK IN PROGRESS ----------------
+    // ⚠️ DO NOT EXPOSE via JNI or call from the app. AP mode beacons (open/WPA2) + tracks client
+    // RSSI + has a full WPA2 Authenticator, BUT a client CANNOT complete association (needs the
+    // 8812 AP/master HW bring-up: HW beacon queue + TSF + per-station ACK) and the path wedges the
+    // USB on exit. Kept as in-progress scaffolding only; see the banner on startAp() in the .cpp.
+    void startAp(const std::string& ssid, int channel, const std::string& password = "");
+    void stopAp();
+    struct ApStation { Mac mac; int rssiDbm; int state; };  // state 4=assoc, 7=authenticated
+    std::vector<ApStation> apStations();
+
     State state() const { return _state.load(); }
     int   rssiDbm() const { return _rssi.load(); }
     int   channel() const { return _params.channel; }   // resolved AP channel (for UI)
@@ -91,11 +118,22 @@ private:
         return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
     }
     void* _dev; void* _rm; void* _rtl = nullptr; OnRtpFn _onRtp; OnStateFn _onState;
+    OnRtpFn _ipSink;   // downlink general-IP (TUN) sink, optional
+    std::vector<std::vector<uint8_t>> _ipQ;   // httpGet: captured inbound IP packets
+    std::mutex _ipQMtx;
+    std::atomic<bool> _ipCapture{false};
+    std::function<void()> _gratArp;           // re-announce our IP<->MAC (keeps unicast RTP alive)
     // RX pipeline (lives across the connection so the device callback stays valid)
     std::unique_ptr<class RxDeframe> _rx;
     std::unique_ptr<class Wpa2Supplicant> _wpa;
     std::unique_ptr<class LqFeedback> _lq;
     std::unique_ptr<class ApfpvDhcp> _dhcp;
+    // Cached WPA2 PMK (depends ONLY on passphrase+SSID). Precomputed in the background so
+    // the slow (~seconds) PBKDF2 never runs inline in becomeStation — otherwise the RX
+    // doesn't switch to the EAPOL phase until after the AP's ~4s M1 retry window expires.
+    std::array<uint8_t,32> _pmkCache{};
+    std::atomic<bool> _pmkValid{false};
+    void ensurePmk();   // compute+cache the PBKDF2 PMK once (passphrase+SSID only)
     Params _params;
     std::atomic<State> _state{State::Idle};
     std::atomic<int> _rssi{-90};
@@ -123,5 +161,16 @@ private:
     // VRX EIRP-calibration beacon injector
     std::atomic<bool> _beaconRun{false};
     std::thread _beaconThread;
+    // AP mode (SoftAP): beacon thread reuses _beaconRun/_beaconThread; RX drives the handshake.
+    std::atomic<bool> _apRun{false};
+    Mac _apSelf{};
+    bool _apWpa2 = false; int _apChannel = 0; std::string _apSsid;
+    std::array<uint8_t,32> _apPmk{}; std::array<uint8_t,16> _apGtk{};
+    std::unique_ptr<class Wpa2Authenticator> _apAuth;
+    std::mutex _apMtx;
+    std::vector<ApStation> _apStaList;
+    void apOnRx(const uint8_t* f, size_t len, uint8_t rssiRaw);   // AP RX: auth/assoc/eapol
+    void apSend(const std::vector<uint8_t>& mpdu, bool eapol);    // prepend TX desc + radiate
+    void apTrack(const Mac& sta, uint8_t rssiRaw, int state);     // upsert station (state<0 keeps)
 };
 }

@@ -57,6 +57,38 @@ void RadioManagementModule::RunIQK() {
   _iqk.Calibrate(_currentChannel, current_band_type, /*is_recovery=*/false);
 }
 
+/* Faithful port of `_phy_lc_calibrate_8812a` (kernel halrf_8812a_ce.c). The
+ * kernel runs this LC (VCO/LC-tank) calibration with the IQK; the devourer was
+ * omitting it. Enter LCK mode (RF_LCK 0xB4 bit14), start the LC cal (RF_CHNLBW
+ * 0x18 bit15), wait 150 ms, leave LCK mode, restore the channel reg. TX is
+ * paused for the duration (REG_TXPAUSE=0xFF) unless a continuous-tone TX is
+ * active (0x914[18:16]). is2T path A only — path B shares the synth on the
+ * 8812. */
+void RadioManagementModule::phy_lc_calibrate_8812a() {
+  /* RF_CHNLBW (0x18) and RF_LCK (0xB4) come from Hal8812PhyReg.h. */
+  constexpr uint32_t MASK = 0xfffffu;  /* RFREGOFFSETMASK */
+  uint32_t reg0x914 = phy_query_bb_reg_public(0x914, bMaskDWord);
+  bool contTx = (reg0x914 & 0x70000) != 0;
+  if (!contTx) _device.rtw_write8(0x0522, 0xFF);   /* REG_TXPAUSE: pause TX */
+
+  /* enter LCK mode */
+  uint32_t tmp = phy_query_rf_reg(RfPath::RF_PATH_A, RF_LCK, MASK);
+  phy_set_rf_reg(RfPath::RF_PATH_A, RF_LCK, MASK, tmp | (1u << 14));
+
+  /* read RF18, start LC cal (bit15), wait */
+  uint32_t lc_cal = phy_query_rf_reg(RfPath::RF_PATH_A, RF_CHNLBW, MASK);
+  phy_set_rf_reg(RfPath::RF_PATH_A, RF_CHNLBW, MASK, lc_cal | 0x08000u);
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+  /* leave LCK mode */
+  tmp = phy_query_rf_reg(RfPath::RF_PATH_A, RF_LCK, MASK);
+  phy_set_rf_reg(RfPath::RF_PATH_A, RF_LCK, MASK, tmp & ~(1u << 14));
+
+  if (!contTx) _device.rtw_write8(0x0522, 0x00);   /* restore TXPAUSE */
+  /* recover channel number */
+  phy_set_rf_reg(RfPath::RF_PATH_A, RF_CHNLBW, MASK, lc_cal);
+}
+
 uint32_t RadioManagementModule::phy_query_bb_reg_public(uint16_t regAddr,
                                                        uint32_t bitMask) {
   return phy_query_bb_reg(regAddr, bitMask);
@@ -381,22 +413,57 @@ void RadioManagementModule::phy_SwChnlAndSetBwMode8812() {
     _logger->info("=== END DEVOURER_DUMP_CANARY ===");
   };
 
+  /* DO NOT "restore" the RFE register 0xcb8/0xeb8 after the IQK. A usbmon register
+   * diff of the kernel connecting to the SAME AP on the SAME dongle shows the kernel
+   * runs with 0xcb8/0xeb8 = 0x00000000: its IQK zeroes them and it deliberately
+   * never restores the BB-table value (0x00508242). 0xcb8 = rA_RFE_Jaguar is the
+   * antenna TX/RX switch; forcing it to 0x00508242 (an earlier restoreRFE() here,
+   * added on a wrong theory) diverges from the working kernel and locks the front
+   * end out of transmit — the MAC drains the FIFO but nothing radiates, while RX
+   * still works (exactly the observed TX-silence). Match the kernel: leave
+   * 0xcb8/0xeb8 as the IQK leaves them (0). */
+
   /* Trigger I/Q calibration. Set by `phy_SwBand8812` on band
    * transitions and (post-init) on the very first channel-set via
    * `HalModule::rtl8812au_hal_init` → `ArmIQKOnNextChannelSet`.
    * Optional override: `DEVOURER_FORCE_IQK=1` runs IQK on every
    * channel-set (used for canary-diff workflow against kernel). */
+  /* Let the RF synthesizer/PLL relock + analog settle after the channel change
+   * BEFORE running the IQK/LCK. The kernel runs cal once in a settled post-hal_init
+   * state; the devourer runs it per-arm right after retuning, so an unsettled PLL can
+   * make the cal converge only intermittently (~1/5 of runs radiate). */
+  if (const char* e = std::getenv("DEVOURER_RF_SETTLE_MS"))
+    std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(e)));
+  bool didIQK = false;
   if ((_needIQK || std::getenv("DEVOURER_FORCE_IQK")) &&
       !std::getenv("DEVOURER_DISABLE_IQK")) {
     if (_eepromManager->version_id.ICType == CHIP_8812) {
       _iqk.Calibrate(_currentChannel, current_band_type,
                      /*is_recovery=*/false);
+      didIQK = true;
     } else if (_eepromManager->version_id.ICType == CHIP_8814A) {
       _iqk8814.Calibrate(_currentChannel, current_band_type,
                          /*is_recovery=*/false);
     }
   }
   _needIQK = false;
+
+  /* LC (VCO/LC-tank) calibration. The kernel runs phy_lc_calibrate_8812a
+   * alongside the IQK (halrf); the devourer was SKIPPING it entirely. Without
+   * LCK the RF synthesizer/PA can be mistuned for transmit (RX still works off a
+   * strong beacon) — a candidate for the auth-never-reaches-AP symptom. Run it
+   * right after the IQK, matching the kernel's calibration order. */
+  if (didIQK && !std::getenv("DEVOURER_SKIP_LCK")) {
+    // A/B test proved the LC/VCO cal is NECESSARY for TX radiation (LCK-OFF never
+    // reaches Associating) but it converges intermittently (~1/3 with it) — the per-arm
+    // radiate/silent flicker. Run it N times so a non-locked VCO gets another attempt.
+    int n = 1;   // LCK confirmed necessary (A/B); repeating it is inconclusive + slow.
+    if (const char* e = std::getenv("DEVOURER_LCK_N")) n = std::atoi(e);
+    for (int k = 0; k < n; ++k) phy_lc_calibrate_8812a();
+  }
+  /* NB: RF[0x42] differs vs the kernel in a silent run, but forcing the kernel's value
+   * (0x3ad58) made TX WORSE (0/5 vs 1/5) — it's a per-state CALIBRATION OUTPUT, not a
+   * static init. The intermittency is the IQK/LCK convergence itself, not this reg. */
 
   /* Canary dump runs LAST so it captures the post-IQK / post-pwrtrk
    * state — same observation order as kernel iface reads via

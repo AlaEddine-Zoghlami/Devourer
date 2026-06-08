@@ -11,10 +11,16 @@
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#define close closesocket
+#else
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#endif
 
 namespace apfpv {
 

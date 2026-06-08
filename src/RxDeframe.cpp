@@ -5,6 +5,7 @@
 #include "RxDeframe.h"
 #include "ApfpvStation.h"
 #include <cstring>
+#include <cstdio>
 
 namespace apfpv {
 
@@ -40,23 +41,41 @@ void RxDeframe::onPacket(const Packet& pkt) {
     // mgmt deauth/disassoc from our AP -> immediate link-loss signal
     if (((fc >> 2) & 0x3) == 0x0) {
         uint8_t sub = (fc >> 4) & 0xF;
-        if ((sub == 0xC || sub == 0xA) && _station) _station->notifyDeauth();
+        if ((sub == 0xC || sub == 0xA) && _station) {
+            // Under PMF (802.11w) honor only a BIP-verified (genuine) deauth/disassoc; ignore
+            // forged unprotected ones — the RX-silence watchdog still catches a real link loss.
+            if (!_wpa || !_wpa->pmfActive() || _wpa->verifyProtectedMgmt(f, len))
+                _station->notifyDeauth();
+        }
         return;
     }
     if (((fc >> 2) & 0x3) != 0x2) return;          // data frames only
     if (!(fc & 0x0200)) return;                    // from-DS (AP->STA)
-    if (std::memcmp(f + 4, _self.data(), 6) != 0) return;  // addr1 == us
+    fprintf(stderr, "[rxd] fc=0x%04x len=%zu a1match=%d prot=%d\n", fc, len,
+            (int)(std::memcmp(f+4,_self.data(),6)==0), (int)((fc&0x4000)!=0));
+    // Accept unicast-to-us OR group-addressed (I/G bit in A1[0]): DHCP OFFER/ACK + ARP are
+    // broadcast and FPV video may be multicast. Group frames decrypt with the GTK below.
+    if (!(f[4] & 0x01) && std::memcmp(f + 4, _self.data(), 6) != 0) return;
 
     size_t hdrLen = 24;
     if ((fc & 0x0300) == 0x0300) hdrLen += 6;      // 4-addr
-    if (fc & 0x8000) hdrLen += 2;                  // QoS
+    if (fc & 0x0080) hdrLen += 2;                  // QoS-data (subtype>=8): 2B QoS Control
+                                                   // (was 0x8000 = Order flag — wrong; EAPOL
+                                                   // M1 is QoS-data fc=0x0288, so this was the
+                                                   // header-offset bug that hid the handshake)
     if (len <= hdrLen) return;
 
     const uint8_t* body = f + hdrLen; size_t bodyLen = len - hdrLen;
     std::vector<uint8_t> plain; const uint8_t* llc; size_t llcLen;
     if (fc & 0x4000) {                             // Protected
         if (!_wpa || !_wpa->ready()) return;
-        if (!_wpa->decryptData(f, len, plain)) return;
+        if (!_wpa->decryptData(f, len, plain)) {
+            // ccmphdr[2]==0x00 => CCMP (reserved byte); non-zero => likely TKIP (TSC0).
+            fprintf(stderr, "[dec] FAIL grp=%d fc=0x%04x len=%zu bssidmatch=%d ccmphdr=%02x %02x %02x %02x\n",
+                    (int)(f[4]&1), fc, len, (int)(std::memcmp(f+10,_bssid.data(),6)==0),
+                    f[hdrLen], f[hdrLen+1], f[hdrLen+2], f[hdrLen+3]);
+            return;
+        }
         llc = plain.data(); llcLen = plain.size();
     } else { llc = body; llcLen = bodyLen; }
 
@@ -64,20 +83,43 @@ void RxDeframe::onPacket(const Packet& pkt) {
     static const uint8_t snap[6] = {0xaa,0xaa,0x03,0x00,0x00,0x00};
     if (std::memcmp(llc, snap, 6) != 0) return;
     uint16_t ethertype = (llc[6] << 8) | llc[7];
+    fprintf(stderr, "[rxd2] hdr=%zu llc=%02x%02x%02x et=0x%04x\n", hdrLen, llc[0],llc[1],llc[2], ethertype);
     // EAPOL (0x888E): the WPA2 4-way handshake. MUST route to the supplicant or
     // the handshake never completes and the link stalls at Handshaking.
     if (ethertype == 0x888E) {
         if (_wpa) _wpa->onEapolKey(llc + 8, llcLen - 8);
         return;
     }
-    if (ethertype != 0x0800) return; // IPv4 (video)
+    // ARP responder: reply to "who has <ourIp>?" so peers keep a fresh entry for us and the
+    // unicast RTP/SSH stream doesn't stall when their STALE entry needs re-validation.
+    if (ethertype == 0x0806 && _ourIp && _arpSend && _wpa && llcLen >= 8 + 28) {
+        const uint8_t* a = llc + 8;                          // ARP payload
+        uint32_t tip = (a[24]<<24)|(a[25]<<16)|(a[26]<<8)|a[27];
+        if (a[6]==0x00 && a[7]==0x01 && tip == _ourIp) {     // a request for OUR IP
+            uint8_t r[28]; std::memcpy(r, a, 28);
+            r[6]=0x00; r[7]=0x02;                            // oper = reply
+            std::memcpy(r+8,  _self.data(), 6);              // sender HW = us
+            std::memcpy(r+14, a+24, 4);                      // sender IP = our IP
+            std::memcpy(r+18, a+8, 6);                       // target HW = requester
+            std::memcpy(r+24, a+14, 4);                      // target IP = requester
+            auto m = _wpa->buildEncryptedData(r, 28, 0x0806);
+            if (!m.empty()) _arpSend(m);
+        }
+        return;
+    }
+    if (ethertype != 0x0800) return; // IPv4
     const uint8_t* ip = llc + 8; size_t ipLen = llcLen - 8;
+    // GENERAL-IP BRIDGE: hand the WHOLE IPv4 packet to the TUN sink so SSH / any TCP+UDP
+    // traverses the dongle (it becomes a full L3 interface, not RTP-only). The OS then
+    // routes it. The RTP->5600 + DHCP shortcuts below stay for the dongle-only demo path.
+    if (_onIp) _onIp(ip, ipLen);
     if (ipLen < 20 || (ip[0] >> 4) != 4 || ip[9] != 17) return; // IPv4/UDP
     size_t ihl = (ip[0] & 0x0f) * 4;
     if (ipLen < ihl + 8) return;
     const uint8_t* udp = ip + ihl;
     uint16_t dport = (udp[2] << 8) | udp[3];
     uint16_t udlen = (udp[4] << 8) | udp[5];
+    fprintf(stderr, "[ip-udp] sport=%u dport=%u udlen=%u\n", (udp[0]<<8)|udp[1], dport, udlen);
     // DHCP: replies (OFFER/ACK) arrive on UDP port 68 (BOOTP client). Forward
     // the UDP payload (BOOTP message) to the DHCP state machine so DORA can
     // complete. Without this, the client never sees OFFER and DHCP stalls.

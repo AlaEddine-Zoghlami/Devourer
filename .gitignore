@@ -3,3 +3,6 @@ build
 .cache
 __pycache__/
 *.pyc
+build-win/
+build-linux/
+*.bak

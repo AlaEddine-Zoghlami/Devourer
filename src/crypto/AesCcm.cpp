@@ -158,4 +158,24 @@ bool aes_key_unwrap(const uint8_t kek[16],const uint8_t* wrapped,size_t wlen,uin
     static const uint8_t IV[8]={0xA6,0xA6,0xA6,0xA6,0xA6,0xA6,0xA6,0xA6};
     return memcmp(A,IV,8)==0;
 }
+
+// RFC 3394 AES Key Wrap (inverse of unwrap) — wraps plen bytes (multiple of 8, >=16) into
+// out[plen+8]. Used by the AP-side 4-way (M3) to deliver the GTK encrypted under the KEK.
+void aes_key_wrap(const uint8_t kek[16],const uint8_t* plain,size_t plen,uint8_t* out){
+    size_t n=plen/8;
+    static const uint8_t IV[8]={0xA6,0xA6,0xA6,0xA6,0xA6,0xA6,0xA6,0xA6};
+    uint8_t A[8]; memcpy(A,IV,8);
+    memcpy(out+8,plain,plen);                       // R[1..n] = P
+    for(int j=0;j<=5;j++){
+        for(size_t i=1;i<=n;i++){
+            uint8_t blk[16]; memcpy(blk,A,8); memcpy(blk+8,out+i*8,8);
+            uint8_t enc[16]; aes128_ecb_encrypt(kek,blk,enc);
+            memcpy(A,enc,8);
+            uint64_t t=n*(uint64_t)j+i;
+            for(int k=0;k<8;k++) A[7-k]^=(uint8_t)(t>>(k*8));   // A = MSB64(B) XOR t
+            memcpy(out+i*8,enc+8,8);                            // R[i] = LSB64(B)
+        }
+    }
+    memcpy(out,A,8);                                 // C[0] = A
+}
 }}
