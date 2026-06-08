@@ -9,7 +9,7 @@ extern "C" {
 #include "wfb-ng/src/zfex.h"
 }
 
-#include "devourer/src/WiFiDriver.h"
+#include "WiFiDriver.h"
 #include "wfb-ng/src/rx.hpp"
 #include <jni.h>
 #include <list>
