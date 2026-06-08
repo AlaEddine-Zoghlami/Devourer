@@ -1,274 +1,51 @@
-# devourer — APFPV fork
+# devourer
 
-The Realtek 11ac driver that simply devours its competitors.
+The **capability + JNI layer** of the 3-repo APFPV stack. It takes **[WiFiDriver](https://github.com/AlaEddine-Zoghlami/WiFiDriver)**
+— the first userspace _station-mode_ driver for the RTL8812AU — and adds everything needed to turn a
+station connection into a usable FPV / IP link, plus the Android JNI.
 
-Devourer is a userspace re-implementation of Realtek's RTL88xxAU Wi-Fi
-driver (Jaguar family: RTL8812AU and RTL8821AU shipping on every band,
-RTL8811AU supported via the 8812 code path, RTL8814AU with band-
-specific gaps — see table below), speaking to the chip directly
-through libusb. No kernel module, no `rtl8812au` DKMS tree — just a
-C++20 static library (`WiFiDriver`) plus demo executables for RX, TX
-and the APFPV station probe. It is the OpenIPC project's driver of
-choice for long-range video links built on top of cheap Realtek 11ac
-USB radios.
+```
+PixelPilot (app)  ──▶  devourer (this repo)  ──▶  WiFiDriver (driver, nested submodule)
+```
 
-> **This is the [APFPV](https://github.com/AlaEddine-Zoghlami/Devourer) fork of
-> [openipc/devourer](https://github.com/openipc/devourer).** On top of the stock
-> monitor-mode RX/TX driver it adds a full **station-mode stack** — register-only
-> association, a WPA2 supplicant, scan/probe, 802.11 framing, DHCP and link-quality
-> feedback — so the chip can hold a real WPA2 link to an air unit from userspace
-> without kernel MLME. See [APFPV station mode](#apfpv-station-mode) below. It is
-> consumed as a git submodule by the
-> [PixelPilot APFPV fork](https://github.com/AlaEddine-Zoghlami/PixelPilot).
+## What it adds on top of WiFiDriver
 
-## Hardware landscape
+- **IP layer** — DHCP client + a **configurable static-IP** option (skip DHCP, bind a fixed IP),
+  ARP responder, and a decrypted-IP demux (RTP / DHCP / general TCP+UDP).
+- **FPV** — RTP relay to `127.0.0.1:5600` (drop-in for PixelPilot's UDP-5600 player), LQ/RSSI feedback.
+- **Session** — `ApfpvStation` orchestration + an auto-reconnect supervisor.
+- **WPA2 hardening** — group + PTK rekey, EAPOL + CCMP-PN anti-replay, GTK slots, 802.11w PMF, CSPRNG.
+- **JNI** — `jni/apfpv_jni.cpp` (APFPV station) + `jni/WfbngLink.cpp` (the wfb bridge) for the app.
+- AP / SoftAP authenticator — **WIP, gated off**.
 
-Devourer targets **RTL8812AU**, **RTL8811AU**, **RTL8814AU**, and
-**RTL8821AU** — all members of Realtek's first-generation 802.11ac
-silicon family, internally codenamed **"Jaguar"**. The HAL,
-register-table layout, firmware-download plumbing, and
-`SET_TX_DESC_*_8812` macros in `src/FrameParser.h` are shared across the
-family; chip-specific EEPROM handling, firmware blobs, and RF tables are
-layered on top.
+## Build (host demo)
 
-| Part           | RF / streams    | 2.4 GHz       | 5 GHz UNII-1 (ch36-48) | 5 GHz UNII-2/3 (ch52+) | Notes                                       |
-| -------------- | --------------- | ------------- | ---------------------- | ---------------------- | ------------------------------------------- |
-| **RTL8812AU**  | 2T2R            | TX + RX       | TX + RX                | TX + RX                | VID/PID `0bda:8812`; reference part — works on every channel/band combo |
-| **RTL8811AU**  | 1T1R            | TX + RX       | TX + RX                | TX + RX                | 1T1R cut of 8812 silicon; rides 8812 code path with `RFType=RF_TYPE_1T1R` selected from `REG_SYS_CFG` bit 27. Status mirrored from 8812 — not separately exercised |
-| **RTL8814AU**  | 4T4R, 3-SS max  | RX only       | RX only                | TX + RX                | VID/PID `0bda:8813`; 2-SS effective on USB-2. 5 GHz UNII-2/3 TX produces on-air frames after the 8814A-specific band-switch + channel-set chain. 2.4 GHz TX still doesn't reach receivers |
-| **RTL8821AU**  | 1T1R AC + BT    | TX + RX       | TX + RX                | TX + RX | OEM-rebadged as TP-Link Archer T2U Plus (`2357:0120`) etc. UNII-2/3 TX has cross-receiver asymmetry against 8812AU peers |
-
-Successor families (`Jaguar2` / `Jaguar+` — 8812BU, 8822BU/BE, etc., and
-the later `Kestrel` 11ax generation) are **out of scope**: they share
-the Realtek "AU" / "BU" branding but the baseband and HAL differ enough
-that they would need their own driver. NB: RTL8821AU itself is Jaguar
-wave 1 (CHIP_8821 = 7 in Realtek's HalVerDef, shares the enum with
-CHIP_8812), not Jaguar2 — the naming is a known trap.
-
-> Heads up — some Realtek USB sticks ship in "ZeroCD" mode and enumerate first
-> as a USB mass-storage device exposing the Windows driver installer
-> (`0bda:1a2b` is the canonical offender), then re-enumerate as the NIC after
-> a mode switch. If `libusb_open_device_with_vid_pid(ctx, 0x0bda, 0x8812)`
-> returns NULL, check `lsusb` — you may need `usb_modeswitch` to flip it
-> first.
-
-## Building
-
-Toolchain: CMake ≥ 3.15, a C++20 compiler, and libusb-1.0.
-
-### Linux / macOS
-
-libusb is located via `pkg-config`:
+WiFiDriver is a **nested** submodule, so clone recursively (or init the submodule), then build with
+CMake (libusb-1.0, C++20, **CMake ≥ 3.24** for the whole-archive link):
 
 ```sh
-# Debian/Ubuntu
-sudo apt install build-essential cmake pkg-config libusb-1.0-0-dev
-# macOS (Homebrew)
-brew install cmake pkg-config libusb
-
-cmake -S . -B build
-cmake --build build -j
+git submodule update --init --recursive
+cmake -B build -S .
+cmake --build build --target ApfpvCompliance
 ```
 
-### Windows
-
-Dependencies come from vcpkg. Set `VCPKG_ROOT` so the CMake toolchain file at
-`$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake` resolves:
-
-```powershell
-git clone https://github.com/Microsoft/vcpkg.git
-cd vcpkg
-.\bootstrap-vcpkg.bat
-.\vcpkg integrate install
-.\vcpkg install libusb
-```
-
-Then the same `cmake -S . -B build && cmake --build build` from the project
-root.
-
-### Build artifacts
-
-- `WiFiDriver` — static library; link this from your application.
-- `WiFiDriverDemo` — RX example built from `demo/main.cpp`. Walks every
-  Realtek device under VID `0bda` and tries to open it; sets monitor mode
-  on channel 36 / 20 MHz, runs the read loop.
-- `WiFiDriverTxDemo` — TX example built from `txdemo/main.cpp`. Opens the
-  device via `libusb_open_device_with_vid_pid` by default, or wraps a USB
-  fd passed as `argv[1]` (the Termux-on-Android pattern using
-  `libusb_wrap_sys_device`). Forks RX into a child, TX-loops a hardcoded
-  beacon in the parent.
-- `ApfpvProbe` — APFPV station-mode probe built from `demo/apfpv_probe.cpp`.
-  The empirical **ACK-survival gate**: does the RTL8812AU auto-ACK in station
-  mode when armed purely via registers (no kernel MLME)? Run it on a Linux
-  laptop with an AU dongle against an air unit and read the verdict
-  (`GO_LinkHeld` / `NOGO_Deauthed` / `TXFAIL_NoAuthResp`). See
-  [`BUILD_AND_TEST.md`](BUILD_AND_TEST.md) for the full runbook.
-
-### Demo env vars
-
-Common to both demos:
-
-- `DEVOURER_PID=0xNNNN` — restrict the device-open loop to a single PID
-  (e.g. `0x8813` for RTL8814AU).
-- `DEVOURER_VID=0xNNNN` — override VID (default `0x0bda`). Needed for
-  OEM-rebadged dongles like the TP-Link Archer T2U Plus (`2357:0120`).
-- `DEVOURER_CHANNEL=N` — override the demo's monitor channel (e.g. `6`
-  for 2.4 GHz, `36` for 5 GHz).
-- `DEVOURER_SKIP_RESET=1` — skip `libusb_reset_device` before claim. Useful
-  when picking up a chip whose firmware is already running (e.g. after
-  unbinding a kernel driver that left fw state intact).
-- `DEVOURER_FORCE_TXPWR=1` — force the per-rate TX-power loop to run during
-  channel switch. Skipped by default in 8814 monitor mode: the loop issues
-  ~300 vendor control transfers and the resulting per-rate indices are
-  unused for RX-only operation.
-- `DEVOURER_SKIP_TXPWR=1` — skip the per-rate TX-power loop entirely on
-  every chip. Useful for fast iteration during BB/RF debugging when the
-  per-rate indices aren't relevant to what you're measuring.
-- `DEVOURER_FORCE_IQK=1` — run phydm I/Q calibration on every channel-set,
-  not just band transitions. For 8814, IQK is otherwise off by default —
-  the kernel doesn't run it on `iw set channel` either, and devourer
-  matches that behaviour.
-- `DEVOURER_DISABLE_IQK=1` — never run IQK, even when armed by a band
-  transition. Diagnostic — IQK-output BB regs stay at their BB-init seeds.
-- `DEVOURER_PHYDM_WATCHDOG=1` — start the periodic phydm DM watchdog
-  thread (FA-counter statistics + DIG IGI walk every ~2 s). Off by
-  default because the watchdog's BB reads/writes share libusb's
-  transfer queue with the TX bulk path and measurably drop sustained
-  TX throughput on Jaguar chips. Use for canary-diff workflows and
-  RX-only DIG tuning.
-- `DEVOURER_DUMP_CANARY=1` — emit a canonical post-channel-set dump of
-  BB/MAC/RF anchor registers. Feeds the `tests/canary_diff.py`
-  cross-validation tool against `tools/canary_kernel_dump.sh` output.
-- `DEVOURER_USB_QUIET=1` — downgrade libusb log level from DEBUG to
-  WARNING (DEBUG produces ~7 MB per 15 s and can fill `/tmp` mid-capture).
-
-`WiFiDriverTxDemo`-only knobs patch the canonical beacon's radiotap
-header before the TX loop:
-
-- `DEVOURER_TX_MCS=N` — HT MCS index. Default 1.
-- `DEVOURER_TX_LDPC=1` — FEC type LDPC (vs default BCC).
-- `DEVOURER_TX_STBC=N` — STBC stream count (0..3). Default 0.
-- `DEVOURER_TX_BW=20|40|80|160` — bandwidth.
-- `DEVOURER_TX_VHT=1` — switch from HT MCS field (radiotap bit 19) to
-  VHT info field (bit 21). Exposes `DEVOURER_TX_VHT_MCS=N` (VHT MCS
-  index, 0..9 typical) and `DEVOURER_TX_VHT_NSS=N` (spatial streams).
-  `_LDPC` / `_STBC` / `_BW` apply to whichever (HT/VHT) mode is active.
-
-## APFPV station mode
-
-The fork layers a register-only **station** path on top of the base driver, so
-the radio can associate and hold a WPA2 link to an air unit entirely from
-userspace. The added pieces live in `src/`:
-
-| Component | Role |
-| --------- | ---- |
-| `StationMode` / `ApfpvStation` | Station bring-up, association state machine, link supervision |
-| `Wpa2Supplicant` / `Wpa2Crypto` | 4-way handshake and key management |
-| `crypto/Sha1Hmac`, `crypto/AesCcm` | PBKDF2-WPA2 / HMAC-SHA1 and AES-CCM primitives |
-| `ScanProbe` | Active scan + probe-request negotiation |
-| `Dot11Frames` | 802.11 management/data frame builders + parsers |
-| `RxDeframe` | Station RX path: 802.11 → payload, real-RSSI extraction |
-| `StationTxDesc` | Station TX descriptor layout |
-| `ApfpvDhcp` | Minimal DHCP client for the air-unit link |
-| `LqFeedback` | Link-quality feedback channel |
-
-### Offline crypto verification (no hardware)
-
-The WPA2 crypto primitives are checked against canonical vectors with nothing
-but a C++17 compiler — no libusb, no radio:
+`ApfpvCompliance` is an end-to-end host test (scan / connect / WPA2 / DHCP / RTP). Example:
 
 ```sh
-g++ -std=c++17 -Isrc tests/crypto_test.cpp src/crypto/Sha1Hmac.cpp src/crypto/AesCcm.cpp -o ctest
-./ctest
-# SHA1(abc): OK / HMAC-SHA1: OK / PBKDF2 WPA2: OK / AES-CCM roundtrip: OK
+DEVOURER_PID=0x881a APFPV_TESTS=connect APFPV_SSID=<ssid> APFPV_PASS=<pass> ./build/ApfpvCompliance
 ```
 
-The on-hardware gate (`ApfpvProbe`) and the full bring-up order are documented
-in [`BUILD_AND_TEST.md`](BUILD_AND_TEST.md).
+> ⚠️ **Build note:** the two static libs (`libWiFiDriver.a` + `libdevourer.a`) are linked with
+> `--whole-archive` (`$<LINK_LIBRARY:WHOLE_ARCHIVE,…>`). A plain link drops static-init `.o` and
+> **silently breaks TX**. The Android `.so` (PixelPilot) avoids this by compiling all sources into
+> one library — keep one of those two approaches.
 
-## Using the library
+## Android
 
-The caller owns libusb: you must `libusb_init`, open the device, detach any
-kernel driver, and `libusb_claim_interface(handle, 0)` **before** handing
-the handle to `WiFiDriver::CreateRtlDevice`. The factory is intentionally
-thin — see `demo/main.cpp` for the full boilerplate. A minimal RX path:
+Consumed by **PixelPilot** as a submodule; PixelPilot's `cpp/CMakeLists` compiles the driver, this
+layer, the wfb logic, and the JNI directly into one `libWfbngRtl8812.so`.
 
-```cpp
-auto logger = std::make_shared<Logger>();
-WiFiDriver driver(logger);
-auto dev = driver.CreateRtlDevice(handle);     // handle is already claimed
-dev->Init(packetProcessor, SelectedChannel{
-    .Channel      = 36,
-    .ChannelOffset = 0,
-    .ChannelWidth = CHANNEL_WIDTH_20,
-});
-```
+---
 
-`packetProcessor` is your `void(const Packet&)` callback. `Init` runs the
-RX loop until `should_stop` is set, then returns. For TX, use `InitWrite`
-on a channel followed by `send_packet(buffer, len)` where the buffer begins
-with a radiotap header (the iterator in `src/Radiotap.c` extracts
-rate/MCS/VHT/STBC/LDPC/SGI/bandwidth from it).
-
-## Testing
-
-Out-of-band regression rig in `tests/regress.py` — runs a cross-driver
-TX/RX matrix between devourer and the kernel driver across plugged-in
-USB Wi-Fi adapters. Default mode is a 4-cell matrix on one ordered
-pair; `--full-matrix` extends to all ordered pairs; `--encoding-matrix`
-adds radiotap encoding sweeps (HT BCC/LDPC/STBC + VHT BCC/LDPC); and
-`--sniffer-iface IFACE` adds a 3rd-adapter monitor capture for
-verifying what actually flies on-air.
-
-See [`tests/README.md`](tests/README.md) for setup (host + libvirt VM
-modes), per-mode CLI knobs, and the regression matrix's known
-limitations (notably: `aircrack-ng/88XXau` strips radiotap LDPC + STBC
-on the kernel-TX path, so the `kernel`-TX rows of `--encoding-matrix`
-are not authoritative for LDPC/STBC asymmetries — devourer-TX rows
-ARE).
-
-## Project layout
-
-```
-hal/      Vendor headers and tables ported from Realtek's tree
-          Hal8812PhyReg.h, hal8812a_fw.[ch], rtl8812a_spec.h
-          Hal8814PhyReg.h, hal8814a_fw.[ch], Hal8814PwrSeq.[ch]
-          rtl8814a/Hal8814_PhyTables.[ch]    (8814 BB/AGC/RF tables)
-          Hal8812a_PhyRegPg.h                (per-rate TX-power PG table)
-          Hal8812a_TxpwrLmt.h                (per-region TX-power limit table)
-          Hal8812a_TxPwrTrack.[h,cpp]        (phydm thermal-meter delta-swing tables)
-src/      Driver implementation
-          WiFiDriver             thin factory
-          RtlJaguarDevice        orchestrator (RX + TX entry points)
-          HalModule              chip bring-up / power sequencing
-          RadioManagementModule  channel, bandwidth, TX power, up to 4 RF paths
-          EepromManager          EFUSE / EEPROM read + autoload state
-          FirmwareManager        chip-specific firmware download
-          PhyTableLoader         applies chip-cut-conditional BB/AGC tables
-          PowerTracking8812a     phydm thermal-meter TX BB-swing compensation
-          Iqk8812a               phydm I/Q calibration for 8812 / 8821
-          Iqk8814a               phydm I/Q calibration for 8814 (4-path)
-          PhydmWatchdog          opt-in periodic DM thread (FA stats + DIG)
-          RtlUsbAdapter          libusb wrapper (vendor + bulk transfers)
-          FrameParser            RX parsing, TX descriptor layout
-          Radiotap.c             radiotap header iterator
-
-          --- APFPV station stack (fork) ---
-          StationMode/ApfpvStation   register-only association + supervision
-          Wpa2Supplicant/Wpa2Crypto  WPA2 4-way handshake + keys
-          crypto/Sha1Hmac, AesCcm    HMAC-SHA1 / PBKDF2 / AES-CCM primitives
-          ScanProbe                  active scan + probe negotiation
-          Dot11Frames                802.11 frame builders / parsers
-          RxDeframe                  station RX deframing + real RSSI
-          StationTxDesc              station TX descriptor layout
-          ApfpvDhcp                  minimal DHCP client
-          LqFeedback                 link-quality feedback channel
-demo/     RX example + apfpv_probe.cpp (ACK-survival gate)
-txdemo/   TX example (Android / Termux pattern)
-tests/    crypto vectors + cross-driver regression rig
-android/  Android glue (ApfpvStaLink JNI, gsmenu sources) for the PixelPilot fork
-```
-
-## License
-
-GPL-2.0. See [LICENSE](LICENSE).
+Devourer began as a userspace re-implementation of Realtek's RTL88xxAU Wi-Fi driver (monitor/inject
+for wifibroadcast); this fork extends it with the station + IP + FPV + JNI layers above.
