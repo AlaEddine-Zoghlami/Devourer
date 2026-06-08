@@ -25,11 +25,14 @@ add_library(devourer
     src/Wpa2Authenticator.cpp src/Wpa2Authenticator.h)
 target_compile_features(devourer PUBLIC cxx_std_20)
 target_include_directories(devourer PUBLIC src)
-target_link_libraries(devourer PUBLIC WiFiDriver)   # propagates WiFiDriver's headers (hal, src, crypto)
+# WHOLE_ARCHIVE: pull EVERY WiFiDriver .o (+ its static initializers) into dependents — splitting the
+# driver into a separate static lib otherwise drops/reorders static-init .o and silently breaks TX
+# (auth frames stop radiating). Equivalent to the pre-refactor single-lib link.
+target_link_libraries(devourer PUBLIC "$<LINK_LIBRARY:WHOLE_ARCHIVE,WiFiDriver>")
 
 # Host test/demo targets (Linux/Windows): the APFPV behavior suite + ACK-survival probe.
 add_executable(ApfpvCompliance demo/apfpv_compliance.cpp)
-target_link_libraries(ApfpvCompliance PUBLIC devourer PRIVATE PkgConfig::libusb)
+target_link_libraries(ApfpvCompliance PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,devourer>" PkgConfig::libusb)
 
 add_executable(ApfpvProbe demo/apfpv_probe.cpp)
-target_link_libraries(ApfpvProbe PUBLIC devourer PRIVATE PkgConfig::libusb)
+target_link_libraries(ApfpvProbe PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,devourer>" PkgConfig::libusb)
