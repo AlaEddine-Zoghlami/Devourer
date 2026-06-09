@@ -109,6 +109,31 @@ void RxDeframe::onPacket(const Packet& pkt) {
     }
     if (ethertype != 0x0800) return; // IPv4
     const uint8_t* ip = llc + 8; size_t ipLen = llcLen - 8;
+    // De-dup 802.11 retransmissions of RTP BEFORE any sink: as a station we RX unicast RTP
+    // and the AP retransmits each frame until ACKed (~6x). This must run ahead of the _onIp
+    // (TUN) path below — otherwise the duplicates reach the decoder via the OS route. Retries
+    // reuse the RTP seq, so drop a UDP/5600 packet whose (payload-type, seq) repeats the last.
+    if (ipLen >= 20 && (ip[0] >> 4) == 4 && ip[9] == 17) {
+        size_t ihl0 = (ip[0] & 0x0f) * 4;
+        if (ipLen >= ihl0 + 8 + 4) {
+            const uint8_t* u = ip + ihl0;
+            if (((u[2] << 8) | u[3]) == 5600) {
+                const uint8_t* r = u + 8;
+                uint8_t  pt = r[1] & 0x7f;
+                uint16_t sq = (uint16_t)((r[2] << 8) | r[3]);
+                _dbgRx++;
+                // Window de-dup: a retransmit reuses the RTP seq but can arrive reordered,
+                // so check the last 128 seqs for this pt (not just the previous packet).
+                bool dup = false;
+                for (int i = 0; i < 128; i++) if (_seqValid[pt][i] && _seqHist[pt][i] == sq) { dup = true; break; }
+                if ((_dbgRx % 300) == 0)
+                    fprintf(stderr, "[rtp-dedup] pt=%u rx=%d drop=%d seq=%u\n", pt, _dbgRx, _dbgDrop, sq);
+                if (dup) { _dbgDrop++; return; }   // duplicate -> drop before _onIp + shortcut
+                _seqHist[pt][_seqPos[pt]] = sq; _seqValid[pt][_seqPos[pt]] = true;
+                _seqPos[pt] = (uint8_t)((_seqPos[pt] + 1) & 127);
+            }
+        }
+    }
     // GENERAL-IP BRIDGE: hand the WHOLE IPv4 packet to the TUN sink so SSH / any TCP+UDP
     // traverses the dongle (it becomes a full L3 interface, not RTP-only). The OS then
     // routes it. The RTP->5600 + DHCP shortcuts below stay for the dongle-only demo path.
@@ -132,7 +157,7 @@ void RxDeframe::onPacket(const Packet& pkt) {
     uint16_t ulen = udlen;
     if (ulen < 8 || (size_t)ulen > ipLen - ihl) return;
     const uint8_t* rtp = udp + 8; size_t rtpLen = ulen - 8;
-    if (rtpLen && _onRtp) _onRtp(rtp, rtpLen);
+    if (rtpLen && _onRtp) _onRtp(rtp, rtpLen);   // (RTP de-dup happens earlier, ahead of _onIp)
 }
 
 } // namespace apfpv

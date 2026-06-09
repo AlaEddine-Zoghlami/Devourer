@@ -35,5 +35,11 @@ private:
     uint32_t _ourIp = 0;
     std::function<void(const std::vector<uint8_t>&)> _arpSend;
     ApfpvStation* _station = nullptr;
+    // Per-payload-type recent-RTP-seq window for dropping 802.11-retransmit duplicates
+    // (reordered retransmits need a window, not just the previous seq) + debug counters.
+    uint16_t _seqHist[128][128] = {};
+    bool     _seqValid[128][128] = {};
+    uint8_t  _seqPos[128] = {};
+    int      _dbgRx = 0, _dbgDrop = 0;
 };
 }

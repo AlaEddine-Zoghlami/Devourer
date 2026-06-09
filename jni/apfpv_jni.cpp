@@ -32,6 +32,7 @@ using namespace apfpv;
 struct StaCtx {
     libusb_context*               usb = nullptr;
     libusb_device_handle*         handle = nullptr;
+    int                           wrappedFd = -1;   // fd ctx->handle was wrapped from (replug detection)
     std::unique_ptr<WiFiDriver>   driver;
     std::unique_ptr<RtlJaguarDevice> rtl;   // owns adapter + radio manager
     std::unique_ptr<ApfpvStation> station;
@@ -48,6 +49,7 @@ struct StaCtx {
     // instead of contending the event lock with the cal's synchronous control reads
     // (daemon-vs-direct-call serialization; critical here since tv=100ms locks long).
     std::shared_ptr<std::atomic<bool>> rxQuiesce = std::make_shared<std::atomic<bool>>(false);
+    std::atomic<bool>             connecting{false};  // reject concurrent/replug double-fire connects (CreateRtlDevice race)
 };
 
 // Forward state to Java (onNativeState). The state callback can fire either on
@@ -115,6 +117,11 @@ static bool ensureStation(StaCtx* ctx) {
         ctx->station = std::make_unique<ApfpvStation>(
             &ctx->rtl->adapter(), &ctx->rtl->radioManager(), onRtp, onState);
         ctx->station->setDevice(ctx->rtl.get());
+        // Clear any STUCK RX-pause carried over from a prior (mid-TX/stream) device — on a
+        // replug the StaCtx (and this shared flag) is reused; if it's left true the event loop
+        // yields forever -> auth TX radiates but no RX reply -> FAIL_NO_AP. A full app restart
+        // "fixed" it only because it made a fresh StaCtx. Reset on every (re)build.
+        ctx->rxQuiesce->store(false);
         ctx->rtl->adapter().setQuiesceFlag(ctx->rxQuiesce);  // event thread yields during cal
         // Start the libusb event loop (drives async RX URBs + async TX).
         if (!ctx->evtRun.load()) {
@@ -164,6 +171,15 @@ Java_com_openipc_wfbngrtl8812_ApfpvStaLink_nativeStaConnect(
         jint channel, jint bandwidth, jstring jssid, jstring jpass, jstring jbssid, jstring jStaticIp) {
     auto* ctx = reinterpret_cast<StaCtx*>(inst);
     if (!ctx) return;
+    // Reject a CONCURRENT connect: replug fires onUsbHotplug on ATTACHED+PERMISSION -> two
+    // "apfpv-connect" threads -> two ensureStation/CreateRtlDevice on the shared ctx -> CRASH,
+    // and they tear down each other's device mid-arm -> endless Reconnecting/Arming LOOP.
+    bool _expected = false;
+    if (!ctx->connecting.compare_exchange_strong(_expected, true)) {
+        LOGI("connect already in progress — ignoring concurrent call");
+        return;
+    }
+    struct ConnGuard { std::atomic<bool>& f; ~ConnGuard() { f.store(false); } } _cg{ctx->connecting};
     if (!ctx->jlink) ctx->jlink = env->NewGlobalRef(jlink);
 
     // libusb must have initialized in nativeStaInitialize (option set before init).
@@ -171,13 +187,41 @@ Java_com_openipc_wfbngrtl8812_ApfpvStaLink_nativeStaConnect(
     if (!ctx->usb) {
         LOGE("libusb context null — cannot connect"); postState(ctx, ApfpvStation::State::FailNoAp); return;
     }
-    // Unrooted USB-host path (same as the wfb monitor path): adopt the fd ONCE.
+    // REPLUG: a re-inserted dongle is a NEW fd. The old ctx->handle drives the DEAD device
+    // (no TX -> FAIL_NO_AP "not in range"). If the fd changed, fully tear down the stale
+    // station/device/handle so we rebuild on the fresh fd — both the wrap-once guard below
+    // AND ensureStation's "build once" guard would otherwise keep using the dead handle.
+    if (ctx->handle && ctx->wrappedFd != fd) {
+        LOGI("replug: fd %d -> %d, re-initialising device", ctx->wrappedFd, fd);
+        if (ctx->station) ctx->station->disconnect();   // stops supervisor + RX (URB pool + sync thread)
+        // Stop the libusb event loop BEFORE freeing the device — otherwise its in-flight
+        // RX URB callbacks dereference the freed RtlUsbAdapter (the SIGABRT on replug).
+        // ensureStation restarts the thread (its `if (!evtRun)` guard) on the new handle.
+        if (ctx->evtRun.exchange(false) && ctx->evtThread.joinable()) ctx->evtThread.join();
+        ctx->station.reset();
+        ctx->rtl.reset();
+        ctx->driver.reset();
+        libusb_close(ctx->handle);
+        ctx->handle = nullptr;
+        // Repeatedly wrap/close adopted fds on the SAME libusb context corrupts its internal
+        // device list — the 2nd replug's wrapped handle then has a NULL device -> SEGV in the
+        // new RtlUsbAdapter ctor's first libusb_control_transfer. Give the new fd a FRESH
+        // libusb context (same init the first connect used).
+        if (ctx->usb) { libusb_exit(ctx->usb); ctx->usb = nullptr; }
+        libusb_set_option(nullptr, LIBUSB_OPTION_NO_DEVICE_DISCOVERY);
+        if (libusb_init(&ctx->usb) < 0 || !ctx->usb) {
+            LOGE("replug: libusb re-init failed");
+            postState(ctx, ApfpvStation::State::FailNoAp); return;
+        }
+    }
+    // Unrooted USB-host path (same as the wfb monitor path): adopt the fd.
     // The scan may already have wrapped it — don't re-wrap (that leaks handles).
     if (!ctx->handle) {
         if (libusb_wrap_sys_device(ctx->usb, (intptr_t)fd, &ctx->handle) < 0 || !ctx->handle) {
             LOGE("libusb_wrap_sys_device failed (fd=%d)", fd);
             postState(ctx, ApfpvStation::State::FailNoAp); return;
         }
+        ctx->wrappedFd = fd;
     }
 
     // Build (or reuse) the device + station — same instance the scan used, so we

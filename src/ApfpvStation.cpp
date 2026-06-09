@@ -443,8 +443,14 @@ bool ApfpvStation::runConnectChain() {
                 }
                 RxDeframe* rx = _rx.get(); if (rx) rx->onPacket(pkt); return;
             }
-            const uint8_t* f = pkt.Data.data(); size_t n = pkt.Data.size();
-            if (n < 24) return;
+            size_t n = pkt.Data.size();
+            if (n < 24 || n > 4096) return;
+            // Copy the frame off the RX span before parsing: pkt.Data points into the
+            // USB transfer buffer, which the async RX path can recycle while the beacon
+            // parser is still walking it -> use-after-free -> SIGSEGV in ScanProbe on
+            // busy RF. A stable local copy removes that window.
+            std::vector<uint8_t> framebuf(pkt.Data.begin(), pkt.Data.end());
+            const uint8_t* f = framebuf.data();
             uint16_t fc = (uint16_t)(f[0] | (f[1] << 8));
             if (((fc>>2)&3)==0 && n >= 30) {
                 uint8_t sub = (fc>>4)&0xF;
@@ -719,7 +725,7 @@ void ApfpvStation::supervisorLoop() {
 
         if (s == State::Streaming) {
             backoff = _params.reconnectBackoffMs;   // reset backoff on healthy link
-            if (++gratTick >= 20) { gratTick = 0; if (_gratArp) _gratArp(); }  // re-announce ARP ~2s
+            if (++gratTick >= 10) { gratTick = 0; if (_gratArp) _gratArp(); }  // re-announce ARP ~1s (keep AP entry fresh on lossy links)
             bool lost = _deauth.load();
             // RX-silence watchdog: no data/beacon for rxTimeoutMs => link gone.
             if (!lost && (nowMs() - _lastRxMs.load()) > _params.rxTimeoutMs) lost = true;
@@ -755,13 +761,21 @@ void ApfpvStation::supervisorLoop() {
 
 void ApfpvStation::disconnect() {
     _run.store(false);
-    if (_supervisor.joinable()) _supervisor.join();
+    // Join-safe: NEVER join the current thread (-> EINVAL "Invalid argument" -> uncaught
+    // std::system_error -> SIGABRT, seen on replug when the JNI re-init teardown disconnect
+    // races/repeats the Java stopAdapters disconnect), and tolerate an already-reaped thread.
+    auto safeJoin = [](std::thread& t) {
+        if (!t.joinable()) return;
+        if (t.get_id() == std::this_thread::get_id()) { t.detach(); return; }
+        try { t.join(); } catch (...) { if (t.joinable()) { try { t.detach(); } catch (...) {} } }
+    };
+    safeJoin(_supervisor);
     // Stop the RX: async URB pool (default) + legacy sync read thread.
     if (_rtl) {
         reinterpret_cast<RtlJaguarDevice*>(_rtl)->should_stop = true;
         reinterpret_cast<RtlJaguarDevice*>(_rtl)->StopAsyncRx();
     }
-    if (_rxThread.joinable()) _rxThread.join();
+    safeJoin(_rxThread);
     set(State::Idle);
 }
 

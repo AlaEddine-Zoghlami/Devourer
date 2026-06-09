@@ -51,7 +51,11 @@ public:
                     // reconnect tuning — matched to wpa_supplicant defaults the
                     // VRX relies on: immediate re-associate, ~5s scan interval.
                     bool autoReconnect=true;
-                    int  rxTimeoutMs=1500;         // no RTP/beacon => lost
+                    int  rxTimeoutMs=8000;         // no RTP/beacon => lost. Tolerant on purpose:
+                                                   // a brief RX gap must NOT trigger the full
+                                                   // re-scan/auth/4-way reconnect — on flaky USB
+                                                   // hosts (MediaTek) that caused stream-killing
+                                                   // flapping (audio blips, video keyframe never lands)
                     int  reconnectBackoffMs=0;     // immediate (wpa_supplicant-like)
                     int  scanIntervalMs=5000;      // wpa_supplicant default scan_interval
                     int  maxBackoffMs=5000; };
