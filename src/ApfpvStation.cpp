@@ -413,6 +413,7 @@ bool ApfpvStation::runConnectChain() {
         return dev.sendStationFrameSync(const_cast<uint8_t*>(f.data()), f.size());
     };
     StationMode sta(dev, rm, sendFrame);
+    sta.setConnectWidth(_params.bandwidth == 40 ? CHANNEL_WIDTH_40 : CHANNEL_WIDTH_20);  // honor Params.bandwidth (20|40)
     MacAddr self{}, bssid{};
     // NOTE: our MAC is read from REG_MACID AFTER the device is brought up (below).
     // Reading it before Init returned EFUSE-unloaded garbage (e.g. ea:ea:ea:...).

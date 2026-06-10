@@ -210,7 +210,7 @@ int WfbngLink::run(JNIEnv *env, jobject context, jint wifiChannel, jint bw, jint
             args->mcs_index = 0;
             args->vht_mode = false;
             args->short_gi = false;
-            args->bandwidth = 20;
+            args->bandwidth = bw;   // follow the configured GS bandwidth (OpenIPC GS runs one width for RX+uplink)
             args->k = 1;
             args->n = 5;
             args->radio_port = wfb_tx_port;
