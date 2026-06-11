@@ -6,8 +6,11 @@
 #include "ApfpvStation.h"
 #include <cstring>
 #include <cstdio>
+#include <chrono>
 #include <android/log.h>
 
+// --- throughput bottleneck diag: logs timing breakdown every 500 packets ---
+#define RX_DIAG_INTERVAL 500
 namespace apfpv {
 
 RxDeframe::RxDeframe(const Mac& self, const Mac& bssid, Wpa2Supplicant* wpa,
@@ -52,8 +55,7 @@ void RxDeframe::onPacket(const Packet& pkt) {
     }
     if (((fc >> 2) & 0x3) != 0x2) return;          // data frames only
     if (!(fc & 0x0200)) return;                    // from-DS (AP->STA)
-    fprintf(stderr, "[rxd] fc=0x%04x len=%zu a1match=%d prot=%d\n", fc, len,
-            (int)(std::memcmp(f+4,_self.data(),6)==0), (int)((fc&0x4000)!=0));
+    // fprintf removed: blocks RX thread at 65Mbps — use rxd-diag instead
     // Accept unicast-to-us OR group-addressed (I/G bit in A1[0]): DHCP OFFER/ACK + ARP are
     // broadcast and FPV video may be multicast. Group frames decrypt with the GTK below.
     if (!(f[4] & 0x01) && std::memcmp(f + 4, _self.data(), 6) != 0) return;
@@ -67,25 +69,24 @@ void RxDeframe::onPacket(const Packet& pkt) {
     if (len <= hdrLen) return;
 
     const uint8_t* body = f + hdrLen; size_t bodyLen = len - hdrLen;
-    std::vector<uint8_t> plain; const uint8_t* llc; size_t llcLen;
+    // Pre-allocated buffer per thread — avoids heap alloc per packet (5600/s at 65Mbps)
+    static thread_local std::vector<uint8_t> plainBuf(2048);
+    const uint8_t* llc; size_t llcLen;
+    auto t0 = std::chrono::steady_clock::now();
     if (fc & 0x4000) {                             // Protected
         if (!_wpa || !_wpa->ready()) return;
-        if (!_wpa->decryptData(f, len, plain)) {
+        if (!_wpa->decryptData(f, len, plainBuf)) {
             _dbgDecFail++;
-            // ccmphdr[2]==0x00 => CCMP (reserved byte); non-zero => likely TKIP (TSC0).
-            fprintf(stderr, "[dec] FAIL grp=%d fc=0x%04x len=%zu bssidmatch=%d ccmphdr=%02x %02x %02x %02x\n",
-                    (int)(f[4]&1), fc, len, (int)(std::memcmp(f+10,_bssid.data(),6)==0),
-                    f[hdrLen], f[hdrLen+1], f[hdrLen+2], f[hdrLen+3]);
             return;
         }
-        llc = plain.data(); llcLen = plain.size();
+        llc = plainBuf.data(); llcLen = plainBuf.size();
     } else { llc = body; llcLen = bodyLen; }
+    auto t1 = std::chrono::steady_clock::now();   // after CCMP decrypt (or skip)
 
     if (llcLen < 8) return;
     static const uint8_t snap[6] = {0xaa,0xaa,0x03,0x00,0x00,0x00};
     if (std::memcmp(llc, snap, 6) != 0) return;
     uint16_t ethertype = (llc[6] << 8) | llc[7];
-    fprintf(stderr, "[rxd2] hdr=%zu llc=%02x%02x%02x et=0x%04x\n", hdrLen, llc[0],llc[1],llc[2], ethertype);
     // EAPOL (0x888E): the WPA2 4-way handshake. MUST route to the supplicant or
     // the handshake never completes and the link stalls at Handshaking.
     if (ethertype == 0x888E) {
@@ -155,7 +156,6 @@ void RxDeframe::onPacket(const Packet& pkt) {
     const uint8_t* udp = ip + ihl;
     uint16_t dport = (udp[2] << 8) | udp[3];
     uint16_t udlen = (udp[4] << 8) | udp[5];
-    fprintf(stderr, "[ip-udp] sport=%u dport=%u udlen=%u\n", (udp[0]<<8)|udp[1], dport, udlen);
     // DHCP: replies (OFFER/ACK) arrive on UDP port 68 (BOOTP client). Forward
     // the UDP payload (BOOTP message) to the DHCP state machine so DORA can
     // complete. Without this, the client never sees OFFER and DHCP stalls.
@@ -168,7 +168,29 @@ void RxDeframe::onPacket(const Packet& pkt) {
     uint16_t ulen = udlen;
     if (ulen < 8 || (size_t)ulen > ipLen - ihl) return;
     const uint8_t* rtp = udp + 8; size_t rtpLen = ulen - 8;
+    auto t2 = std::chrono::steady_clock::now();   // after IP decode, before RTP forward
     if (rtpLen && _onRtp) _onRtp(rtp, rtpLen);   // (RTP de-dup happens earlier, ahead of _onIp)
+    auto t3 = std::chrono::steady_clock::now();   // after RTP forward (socket send)
+
+    // --- bottleneck diag: timing breakdown every RX_DIAG_INTERVAL packets ---
+    {
+        using namespace std::chrono;
+        _diagPkts++;
+        _diagTotalNs += duration_cast<nanoseconds>(t3 - t0).count();
+        _diagDecNs   += duration_cast<nanoseconds>(t1 - t0).count();  // CCMP decrypt
+        _diagFwdNs   += duration_cast<nanoseconds>(t3 - t2).count();  // RTP sendto()
+        if ((_diagPkts % RX_DIAG_INTERVAL) == 0) {
+            int64_t avgTotal = _diagTotalNs / _diagPkts;
+            int64_t avgDec   = _diagDecNs / _diagPkts;
+            int64_t avgIp    = (_diagTotalNs - _diagDecNs - _diagFwdNs) / _diagPkts; // IP decode
+            int64_t avgFwd   = _diagFwdNs / _diagPkts;
+            __android_log_print(ANDROID_LOG_WARN, "rxd-diag",
+                "pkts=%d total=%lldns | CCMP=%lldns IP=%lldns fwd=%lldns",
+                _diagPkts, (long long)avgTotal, (long long)avgDec,
+                (long long)avgIp, (long long)avgFwd);
+            _diagTotalNs = _diagDecNs = _diagFwdNs = _diagPkts = 0;
+        }
+    }
 }
 
 } // namespace apfpv

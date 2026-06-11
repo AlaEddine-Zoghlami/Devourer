@@ -86,15 +86,50 @@ static bool ensureStation(StaCtx* ctx) {
     if (!ctx->usb || !ctx->handle) return false;
     if (ctx->rtpSock < 0) {
         ctx->rtpSock = ::socket(AF_INET, SOCK_DGRAM, 0);
+        int sndBuf = 4 * 1024 * 1024;  // 4MB — ~500ms at 65Mbps, non-blocking fallback
+        ::setsockopt(ctx->rtpSock, SOL_SOCKET, SO_SNDBUF, &sndBuf, sizeof(sndBuf));
         std::memset(&ctx->rtpDst, 0, sizeof(ctx->rtpDst));
         ctx->rtpDst.sin_family = AF_INET;
         ctx->rtpDst.sin_port = htons(5600);
         ::inet_pton(AF_INET, "127.0.0.1", &ctx->rtpDst.sin_addr);
     }
     StaCtx* c = ctx;
+    // Batched RTP forward: per-packet sendto() costs 85µs syscall at 65Mbps (5600/s).
     auto onRtp = [c](const uint8_t* rtp, size_t len) {
-        if (c->rtpSock >= 0 && rtp && len)
-            ::sendto(c->rtpSock, rtp, len, 0, (sockaddr*)&c->rtpDst, sizeof(c->rtpDst));
+        if (c->rtpSock < 0 || !rtp || !len) return;
+#ifdef __linux__
+        struct Batch { uint8_t buf[16*1024]; struct iovec iov[8]; struct mmsghdr mm[8];
+                       int n = 0; int64_t firstNs = 0; } static thread_local bt;
+        size_t off = 0; for (int i = 0; i < bt.n; i++) off += bt.iov[i].iov_len;
+        // Flush if full, or if >2ms since first packet (prevent stale partial batches)
+        auto nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (bt.n > 0 && bt.firstNs > 0 && (nowNs - bt.firstNs) > 2'000'000) {
+            bt.n = 0; off = 0; bt.firstNs = 0; // drop stale — new batch starts
+        }
+        if (off + len > sizeof(bt.buf) || bt.n >= 8 || (bt.n > 0 && (nowNs - bt.firstNs) > 2'000'000)) {
+            if (bt.n > 0) {
+                struct sockaddr_in *dst = &c->rtpDst;
+                for (int i = 0; i < bt.n; i++) {
+                    memset(&bt.mm[i], 0, sizeof(bt.mm[i]));
+                    bt.mm[i].msg_hdr.msg_iov = &bt.iov[i];
+                    bt.mm[i].msg_hdr.msg_iovlen = 1;
+                    bt.mm[i].msg_hdr.msg_name = dst;
+                    bt.mm[i].msg_hdr.msg_namelen = sizeof(*dst);
+                }
+                ::sendmmsg(c->rtpSock, bt.mm, bt.n, MSG_DONTWAIT);
+            }
+            bt.n = 0; off = 0;
+        }
+        if (bt.n == 0) bt.firstNs = nowNs;
+        memcpy(bt.buf + off, rtp, len);
+        bt.iov[bt.n].iov_base = bt.buf + off;
+        bt.iov[bt.n].iov_len = len;
+        bt.n++;
+#else
+        // Non-Linux fallback (Windows host build): simple non-blocking sendto
+        ::sendto(c->rtpSock, rtp, len, MSG_DONTWAIT, (sockaddr*)&c->rtpDst, sizeof(c->rtpDst));
+#endif
     };
     auto onState = [c](ApfpvStation::State s){ postState(c, s); };
     try {

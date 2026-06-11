@@ -535,6 +535,9 @@ bool ApfpvStation::runConnectChain() {
         if (!ap.found) { set(State::FailNoAp); return false; }
         bssid.b = ap.bssid;
         _params.channel = ap.channel ? ap.channel : _params.channel;
+        // Save BSSID so reconnects skip the scan (avoid scan crash at high bitrate)
+        _params.haveBssid = true;
+        for (int i = 0; i < 6; ++i) _params.bssid[i] = ap.bssid.data()[i];
         sta.setNegotiatedCipher(ScanProbe::chooseCipher(ap.pairwise),
                                 ap.rsnPresent ? ap.groupCipher : 0x000FAC04);
         SCANLOG("CIPHERS: pairwise=0x%08x group=0x%08x (CCMP=0x000FAC04 TKIP=0x000FAC02)",

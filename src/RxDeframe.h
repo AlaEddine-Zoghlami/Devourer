@@ -46,5 +46,8 @@ private:
     int      _dbgDecFail = 0, _dbgLoss = 0;
     uint16_t _lastSeq[128] = {};
     bool     _lastSeqV[128] = {};
+    // Bottleneck diag: cumulative time (ns) spent in onPacket phases per interval
+    int64_t  _diagTotalNs = 0, _diagDecNs = 0, _diagFwdNs = 0;
+    int      _diagPkts = 0;
 };
 }
