@@ -434,6 +434,7 @@ bool ApfpvStation::runConnectChain() {
         auto* rtl = reinterpret_cast<RtlJaguarDevice*>(_rtl);
         StationMode* sp = &sta;
         auto dispatch = [sp, this](const Packet& pkt){
+            if (!sp->_alive.load()) return;  // StationMode destroyed — drop frame
             _rxReady.store(true);
             if (_rxPhase.load() == 1) {
                 const uint8_t* df = pkt.Data.data();
