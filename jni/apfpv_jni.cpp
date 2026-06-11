@@ -39,9 +39,8 @@ struct StaCtx {
     std::unique_ptr<ApfpvStation> station;
     JavaVM*                       jvm = nullptr;
     jobject                       jlink = nullptr;   // global ref to ApfpvStaLink
-    int                           rtpSock = -1;     // Unix DGRAM → "\0my_socket"
-    sockaddr_un                   rtpDst{};
-    socklen_t                     rtpDstLen = 0;    // computed after sun_path set
+    int                           rtpSock = -1;     // UDP → 127.0.0.1:5600
+    sockaddr_in                   rtpDst{};
     // libusb event loop: drives the async RX URB pool + async TX (send_packet)
     // for the kernel-style station I/O. Without it the async transfers never
     // complete -> the auth never radiates.
@@ -87,17 +86,13 @@ static bool ensureStation(StaCtx* ctx) {
     if (ctx->station) return true;
     if (!ctx->usb || !ctx->handle) return false;
     if (ctx->rtpSock < 0) {
-        // Unix Domain DGRAM — bypasses IP stack, ~2-3× faster than UDP loopback.
-        // App already listens on "\0my_socket" via UDSReceiver. No root needed.
-        ctx->rtpSock = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+        ctx->rtpSock = ::socket(AF_INET, SOCK_DGRAM, 0);
         int sndBuf = 4 * 1024 * 1024;
         ::setsockopt(ctx->rtpSock, SOL_SOCKET, SO_SNDBUF, &sndBuf, sizeof(sndBuf));
         std::memset(&ctx->rtpDst, 0, sizeof(ctx->rtpDst));
-        ctx->rtpDst.sun_family = AF_UNIX;
-        // Abstract namespace: first byte '\0', then "my_socket" (matches UDSReceiver)
-        ctx->rtpDst.sun_path[0] = '\0';
-        strcpy(ctx->rtpDst.sun_path + 1, "my_socket");
-        ctx->rtpDstLen = offsetof(struct sockaddr_un, sun_path) + 1 + strlen("my_socket");
+        ctx->rtpDst.sin_family = AF_INET;
+        ctx->rtpDst.sin_port = htons(5600);
+        ::inet_pton(AF_INET, "127.0.0.1", &ctx->rtpDst.sin_addr);
     }
     StaCtx* c = ctx;
     // Batched RTP forward: per-packet sendto() costs 85µs syscall at 65Mbps (5600/s).
@@ -115,13 +110,13 @@ static bool ensureStation(StaCtx* ctx) {
         }
         if (off + len > sizeof(bt.buf) || bt.n >= 8 || (bt.n > 0 && (nowNs - bt.firstNs) > 2'000'000)) {
             if (bt.n > 0) {
-                struct sockaddr_un *dst = &c->rtpDst;
+                struct sockaddr_in *dst = &c->rtpDst;
                 for (int i = 0; i < bt.n; i++) {
                     memset(&bt.mm[i], 0, sizeof(bt.mm[i]));
                     bt.mm[i].msg_hdr.msg_iov = &bt.iov[i];
                     bt.mm[i].msg_hdr.msg_iovlen = 1;
                     bt.mm[i].msg_hdr.msg_name = dst;
-                    bt.mm[i].msg_hdr.msg_namelen = c->rtpDstLen;
+                    bt.mm[i].msg_hdr.msg_namelen = sizeof(*dst);
                 }
                 ::sendmmsg(c->rtpSock, bt.mm, bt.n, MSG_DONTWAIT);
             }
@@ -134,7 +129,7 @@ static bool ensureStation(StaCtx* ctx) {
         bt.n++;
 #else
         // Non-Linux fallback (Windows host build): simple non-blocking sendto
-        ::sendto(c->rtpSock, rtp, len, MSG_DONTWAIT, (sockaddr*)&c->rtpDst, c->rtpDstLen);
+        ::sendto(c->rtpSock, rtp, len, MSG_DONTWAIT, (sockaddr*)&c->rtpDst, sizeof(c->rtpDst));
 #endif
     };
     auto onState = [c](ApfpvStation::State s){ postState(c, s); };
