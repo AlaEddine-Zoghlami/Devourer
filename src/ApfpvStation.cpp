@@ -432,9 +432,12 @@ bool ApfpvStation::runConnectChain() {
     // One dispatch routes by phase: discovery/arm -> StationMode; streaming -> RxDeframe.
     if (_rtl) {
         auto* rtl = reinterpret_cast<RtlJaguarDevice*>(_rtl);
+        // shared_ptr<atomic> survives sta destruction; dispatch checks before calling
+        auto alive = std::make_shared<std::atomic<bool>>(true);
+        sta._alivePtr = alive;
         StationMode* sp = &sta;
-        auto dispatch = [sp, this](const Packet& pkt){
-            if (!sp->_alive.load()) return;  // StationMode destroyed — drop frame
+        auto dispatch = [sp, this, alive](const Packet& pkt){
+            if (!alive->load()) return;  // StationMode destroyed — TOCTOU-safe
             _rxReady.store(true);
             if (_rxPhase.load() == 1) {
                 const uint8_t* df = pkt.Data.data();
