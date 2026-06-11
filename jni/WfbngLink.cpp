@@ -235,10 +235,19 @@ int WfbngLink::run(JNIEnv *env, jobject context, jint wifiChannel, jint bw, jint
         }
 
         auto bandWidth = (bw == 20 ? CHANNEL_WIDTH_20 : CHANNEL_WIDTH_40);
+        // HT40 needs the prime-channel offset (1=LOWER/primary below center, 2=UPPER): offset 0
+        // (DONT_CARE) leaves the chip's subcarrier mapping undefined and 40 MHz RX is garbage.
+        // Lower member of each 40 MHz pair (36,44,52,...,149,157) => LOWER; upper => UPPER.
+        // Same rule as RadioManagementModule::prime_offset_40mhz (kept inline: no rm access here).
+        uint8_t chOff = 0;
+        if (bandWidth == CHANNEL_WIDTH_40) {
+            if (wifiChannel > 14) chOff = ((wifiChannel / 4) & 1) ? 1 /*LOWER*/ : 2 /*UPPER*/;
+            else                  chOff = (wifiChannel <= 7) ? 1 : 2;   // 2.4 GHz
+        }
         rtl_devices.at(fd)->Init(packetProcessor,
                                  SelectedChannel{
                                      .Channel = static_cast<uint8_t>(wifiChannel),
-                                     .ChannelOffset = 0,
+                                     .ChannelOffset = chOff,
                                      .ChannelWidth = bandWidth,
                                  });
     } catch (const std::runtime_error &error) {
