@@ -6,6 +6,7 @@
 #include "ApfpvStation.h"
 #include <cstring>
 #include <cstdio>
+#include <android/log.h>
 
 namespace apfpv {
 
@@ -70,6 +71,7 @@ void RxDeframe::onPacket(const Packet& pkt) {
     if (fc & 0x4000) {                             // Protected
         if (!_wpa || !_wpa->ready()) return;
         if (!_wpa->decryptData(f, len, plain)) {
+            _dbgDecFail++;
             // ccmphdr[2]==0x00 => CCMP (reserved byte); non-zero => likely TKIP (TSC0).
             fprintf(stderr, "[dec] FAIL grp=%d fc=0x%04x len=%zu bssidmatch=%d ccmphdr=%02x %02x %02x %02x\n",
                     (int)(f[4]&1), fc, len, (int)(std::memcmp(f+10,_bssid.data(),6)==0),
@@ -126,9 +128,18 @@ void RxDeframe::onPacket(const Packet& pkt) {
                 // so check the last 128 seqs for this pt (not just the previous packet).
                 bool dup = false;
                 for (int i = 0; i < 128; i++) if (_seqValid[pt][i] && _seqHist[pt][i] == sq) { dup = true; break; }
-                if ((_dbgRx % 300) == 0)
-                    fprintf(stderr, "[rtp-dedup] pt=%u rx=%d drop=%d seq=%u\n", pt, _dbgRx, _dbgDrop, sq);
                 if (dup) { _dbgDrop++; return; }   // duplicate -> drop before _onIp + shortcut
+                // RX-seq-gap loss: how many packets between this and the last UNIQUE one for this pt.
+                if (_lastSeqV[pt]) {
+                    int gap = (int)(uint16_t)(sq - _lastSeq[pt]);
+                    if (gap > 1 && gap < 2000) _dbgLoss += (gap - 1);
+                }
+                _lastSeq[pt] = sq; _lastSeqV[pt] = true;
+                // Health summary every 120 unique pkts: received / dup-dropped / decrypt-failed / lost.
+                if ((_dbgRx % 120) == 0)
+                    __android_log_print(ANDROID_LOG_INFO, "rxd-health",
+                        "rx=%d dropDup=%d decFail=%d lost=%d (pt=%u seq=%u)",
+                        _dbgRx, _dbgDrop, _dbgDecFail, _dbgLoss, pt, sq);
                 _seqHist[pt][_seqPos[pt]] = sq; _seqValid[pt][_seqPos[pt]] = true;
                 _seqPos[pt] = (uint8_t)((_seqPos[pt] + 1) & 127);
             }
