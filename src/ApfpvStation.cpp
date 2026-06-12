@@ -46,8 +46,10 @@ static SelectedChannel legalApfpvChannel(int ch, int bwMHz) {
     if (bwMHz >= 80)
         return SelectedChannel{ c, (uint8_t)HAL_PRIME_CHNL_OFFSET_DONT_CARE, CHANNEL_WIDTH_80 };
     if (bwMHz == 40) {
-        uint8_t off = (c == 36 || c == 44) ? (uint8_t)HAL_PRIME_CHNL_OFFSET_LOWER
-                                           : (uint8_t)HAL_PRIME_CHNL_OFFSET_UPPER;
+        // Kernel get_40mhz_center_channel: {36,38} {40,38} {44,46} {48,46}.
+        // Center>primary → secondary ABOVE → UPPER offset (correct for ch36, ch44).
+        uint8_t off = (c == 36 || c == 44) ? (uint8_t)HAL_PRIME_CHNL_OFFSET_UPPER
+                                           : (uint8_t)HAL_PRIME_CHNL_OFFSET_LOWER;
         return SelectedChannel{ c, off, CHANNEL_WIDTH_40 };
     }
     return SelectedChannel{ c, (uint8_t)HAL_PRIME_CHNL_OFFSET_DONT_CARE, CHANNEL_WIDTH_20 };
@@ -413,7 +415,7 @@ bool ApfpvStation::runConnectChain() {
         return dev.sendStationFrameSync(const_cast<uint8_t*>(f.data()), f.size());
     };
     StationMode sta(dev, rm, sendFrame);
-    sta.setConnectWidth(_params.bandwidth == 40 ? CHANNEL_WIDTH_40 : CHANNEL_WIDTH_20);  // honor Params.bandwidth (20|40)
+    sta.setConnectWidth(_params.bandwidth >= 40 ? CHANNEL_WIDTH_40 : CHANNEL_WIDTH_20);
     MacAddr self{}, bssid{};
     // NOTE: our MAC is read from REG_MACID AFTER the device is brought up (below).
     // Reading it before Init returned EFUSE-unloaded garbage (e.g. ea:ea:ea:...).
@@ -554,6 +556,13 @@ bool ApfpvStation::runConnectChain() {
                 ScanProbe::chooseCipher(ap.pairwise), ap.rsnPresent ? ap.groupCipher : 0x000FAC04);
     }
 
+    // RETUNE to the AP's actual channel before the arm. The scanForSsid hop leaves
+    // the radio on the last scanned channel (e.g. ch46), not the AP's channel (ch44).
+    // arm() uses _rm.current_channel() which must equal the AP's actual channel or
+    SCANLOG("pre-arm tune: want=%d current=%d", (int)_params.channel, (int)rm.current_channel());
+    // the 40 MHz offset selects the wrong secondary -> AP sends 20 MHz frames.
+    rm.set_channel_bwmode((uint8_t)_params.channel, 0, CHANNEL_WIDTH_20);
+    SCANLOG("pre-arm tuned: now=%d", (int)rm.current_channel());
     sta.setPmf(_params.pmf);              // 802.11w RSN caps in the assoc-req (0 = off, no change)
     set(State::Arming);
     sta.setPhaseCb([this](int p){ set(p == 1 ? State::Authenticating : State::Associating); });
