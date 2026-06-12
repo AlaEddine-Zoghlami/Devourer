@@ -722,6 +722,44 @@ bool ApfpvStation::runConnectChain() {
     return true;
 }
 
+void ApfpvStation::handleAddbaRequest(const uint8_t* frame, size_t len) {
+    if (len < 24 + 3 + 7) return;
+    const uint8_t* body = frame + 24;  // skip 3-addr mgmt header
+    u8  dialog = body[2];
+    u16 param  = body[3] | (body[4] << 8);
+    u16 tid    = (param >> 2) & 0x0f;  // TID from BA Parameter Set
+    (void)tid;
+    // Build ADDBA Response: accept TID 0, immediate BA, buffer size 64
+    auto& dev = *reinterpret_cast<RtlUsbAdapter*>(_dev);
+    MacAddr bssid; for (int i=0;i<6;i++) bssid.b[i] = _params.bssid[i];
+    std::vector<uint8_t> rsp;
+    rsp.push_back(0xD0); rsp.push_back(0x00);   // FC: mgmt, action
+    rsp.push_back(0x00); rsp.push_back(0x00);   // duration
+    rsp.insert(rsp.end(), bssid.b.data(), bssid.b.data() + 6); // A1=AP BSSID
+    // A2=self MAC: read from EFUSE
+    for (int i=0;i<6;i++) rsp.push_back(dev.rtw_read8(0x0610 + i));
+    rsp.insert(rsp.end(), bssid.b.data(), bssid.b.data() + 6); // A3=AP BSSID
+    rsp.push_back(0x00); rsp.push_back(0x00);   // seq ctl
+    // ADDBA Response body
+    rsp.push_back(0x03); // Category: Block Ack
+    rsp.push_back(0x01); // Action: ADDBA Response
+    rsp.push_back(dialog); // Dialog token (match request)
+    rsp.push_back(0x00); rsp.push_back(0x00);   // Status: SUCCESS
+    // BA Parameter Set: TID=0, buf=64, immediate BA (mirror request)
+    rsp.push_back((u8)(param & 0xff));
+    rsp.push_back((u8)(param >> 8));
+    rsp.push_back(0x00); rsp.push_back(0x00);   // BA Timeout: 0 = default
+    // Prepend 40-byte TX descriptor (required for on-air radiation — the raw frame
+    // alone would be read as a partial descriptor, garbling the transmission).
+    // Use MACID=1 (mgmt), RAID=0x0c (HT-mixed), rate=0x04 (OFDM-6M for 5GHz).
+    std::vector<uint8_t> txf(40 + rsp.size(), 0);
+    std::memcpy(txf.data() + 40, rsp.data(), rsp.size());
+    apfpv::FillStationTxDesc(txf.data(), (uint16_t)rsp.size(), 40,
+                             1, apfpv::StationFrameKind::Mgmt, 0x0c, 0x04);
+    dev.sendStationFrameSync(txf.data(), txf.size());
+    SCANLOG("ADDBA Response sent (accepted TID=%u buffsize=%u)", tid & 0x0f, 64);
+}
+
 bool ApfpvStation::connect(const Params& p) {
     _params = p;
     bool ok = runConnectChain();

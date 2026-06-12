@@ -45,11 +45,21 @@ void RxDeframe::onPacket(const Packet& pkt) {
     // mgmt deauth/disassoc from our AP -> immediate link-loss signal
     if (((fc >> 2) & 0x3) == 0x0) {
         uint8_t sub = (fc >> 4) & 0xF;
-        if ((sub == 0xC || sub == 0xA) && _station) {
-            // Under PMF (802.11w) honor only a BIP-verified (genuine) deauth/disassoc; ignore
-            // forged unprotected ones — the RX-silence watchdog still catches a real link loss.
-            if (!_wpa || !_wpa->pmfActive() || _wpa->verifyProtectedMgmt(f, len))
-                _station->notifyDeauth();
+        if (sub == 0xC || sub == 0xA) {
+            if (_station) { // deauth/disassoc from AP -> immediate link-loss
+                if (!_wpa || !_wpa->pmfActive() || _wpa->verifyProtectedMgmt(f, len))
+                    _station->notifyDeauth();
+            }
+            return;
+        }
+        // 802.11 Action frame (subtype 0xD): could be ADDBA Request from the AP.
+        // The AP MUST receive an ADDBA Response to start A-MPDU aggregation so we can
+        // receive 30-64 frames per TXOP (needed for 65+ Mbps). Accept TID 0 (best-effort).
+        if (sub == 0xD && _station && len >= 24 + 3) {
+            const uint8_t* body = f + 24; // 3-addr mgmt header
+            if (body[0] == 0x03 && body[1] == 0x00) { // BlockAck category, ADDBA Request
+                _station->handleAddbaRequest(f, len);
+            }
         }
         return;
     }

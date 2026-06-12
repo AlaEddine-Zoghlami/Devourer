@@ -113,6 +113,9 @@ public:
     void notifyRxAlive() { _lastRxMs.store(nowMs()); }
     // RX path calls this if a deauth/disassoc is seen (immediate loss).
     void notifyDeauth()  { _deauth.store(true); }
+    // Handle ADDBA Request from the AP: send ADDBA Response (accept TID 0, immediate BA).
+    // Called from RxDeframe when a Block-Ack action frame arrives. Enables A-MPDU RX.
+    void handleAddbaRequest(const uint8_t* frame, size_t len);
 private:
     void set(State s);
     bool runConnectChain();          // the gated arm->...->stream sequence

@@ -1,5 +1,6 @@
 // ============================================================================
 //  apfpv_jni.cpp — JNI bindings: ApfpvStaLink.java  <->  native ApfpvStation
+#include <sys/un.h>
 //  This is the REAL connective tissue: PixelPilot's Java calls these; they
 //  drive the forked devourer station stack. Mirrors the existing WfbNgLink JNI
 //  registration pattern (libusb fd via wrap_sys_device -> RtlUsbAdapter).
@@ -39,8 +40,9 @@ struct StaCtx {
     std::unique_ptr<ApfpvStation> station;
     JavaVM*                       jvm = nullptr;
     jobject                       jlink = nullptr;   // global ref to ApfpvStaLink
-    int                           rtpSock = -1;     // UDP → 127.0.0.1:5600
-    sockaddr_in                   rtpDst{};
+    int                           rtpSock = -1;     // AF_UNIX DGRAM → "\0my_socket" (UDSReceiver)
+    sockaddr_un                   rtpDst{};
+    socklen_t                     rtpDstLen = 0;
     // libusb event loop: drives the async RX URB pool + async TX (send_packet)
     // for the kernel-style station I/O. Without it the async transfers never
     // complete -> the auth never radiates.
@@ -86,13 +88,14 @@ static bool ensureStation(StaCtx* ctx) {
     if (ctx->station) return true;
     if (!ctx->usb || !ctx->handle) return false;
     if (ctx->rtpSock < 0) {
-        ctx->rtpSock = ::socket(AF_INET, SOCK_DGRAM, 0);
+        ctx->rtpSock = ::socket(AF_UNIX, SOCK_DGRAM, 0);
         int sndBuf = 4 * 1024 * 1024;
         ::setsockopt(ctx->rtpSock, SOL_SOCKET, SO_SNDBUF, &sndBuf, sizeof(sndBuf));
         std::memset(&ctx->rtpDst, 0, sizeof(ctx->rtpDst));
-        ctx->rtpDst.sin_family = AF_INET;
-        ctx->rtpDst.sin_port = htons(5600);
-        ::inet_pton(AF_INET, "127.0.0.1", &ctx->rtpDst.sin_addr);
+        ctx->rtpDst.sun_family = AF_UNIX;
+        ctx->rtpDst.sun_path[0] = '\0';  // abstract namespace
+        strcpy(ctx->rtpDst.sun_path + 1, "my_socket");
+        ctx->rtpDstLen = offsetof(sockaddr_un, sun_path) + 1 + strlen("my_socket");
     }
     StaCtx* c = ctx;
     // Per-packet RTP forward to 127.0.0.1:5600 (the proven pre-throughput path).
@@ -102,7 +105,9 @@ static bool ensureStation(StaCtx* ctx) {
     // loopback is a few µs and never reorders/drops, so video reassembles correctly.
     auto onRtp = [c](const uint8_t* rtp, size_t len) {
         if (c->rtpSock < 0 || !rtp || !len) return;
-        ::sendto(c->rtpSock, rtp, len, MSG_DONTWAIT, (sockaddr*)&c->rtpDst, sizeof(c->rtpDst));
+        // AF_UNIX abstract namespace: bypasses IP stack, ~2-3× faster than UDP loopback.
+        // App's UDSReceiver already listens on "\0my_socket" (always started in VideoPlayer).
+        ::sendto(c->rtpSock, rtp, len, MSG_DONTWAIT, (sockaddr*)&c->rtpDst, c->rtpDstLen);
     };
     auto onState = [c](ApfpvStation::State s){ postState(c, s); };
     try {
