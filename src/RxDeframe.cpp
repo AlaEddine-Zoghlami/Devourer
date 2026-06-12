@@ -103,36 +103,25 @@ void RxDeframe::onPacket(const Packet& pkt) {
         if (_wpa) _wpa->onEapolKey(llc + 8, llcLen - 8);
         return;
     }
-    // A-MPDU reorder for QoS-data video frames (IPv4/UDP/5600). Pass-through
-    // for in-order frames; reorders out-of-order A-MPDU subframes. Non-video
-    // frames (ARP, DHCP, EAPOL, etc.) use the existing direct path below.
+    // A-MPDU reorder disabled — the AP sends single frames (no Block-Ack working yet).
+    // When HW Block-Ack works, re-enable by removing this guard. The reorder buffer
+    // implementation (processReorder) is ready and tested.
+    #if 0
     if ((fc & 0x0088) == 0x0088 && ethertype == 0x0800 && llcLen >= 28) {
-        // Quick check: is this likely a video RTP frame destined for port 5600?
-        const uint8_t* ip = llc + 8;
-        size_t ipl = llcLen - 8;
-        if (ipl >= 20 && (ip[0] >> 4) == 4 && ip[9] == 17) {  // IPv4 + UDP
+        const uint8_t* ip = llc + 8; size_t ipl = llcLen - 8;
+        if (ipl >= 20 && (ip[0] >> 4) == 4 && ip[9] == 17) {
             size_t ihl = (ip[0] & 0x0f) * 4;
             if (ipl >= ihl + 8) {
                 const uint8_t* u = ip + ihl;
-                if (((u[2] << 8) | u[3]) == 5600) {  // RTP port
-                    uint8_t tid = (hdrLen >= 26) ? (f[24] & 0x0f) : 0;
-                    uint16_t seq = (uint16_t)((f[23] << 4) | (f[22] >> 4));
-                    _dbgRx++;
-                    // Health summary every 120 pkts (same interval as old path)
-                    if ((_dbgRx % 120) == 0) {
-                        uint8_t pt = ip[9]; // actually protocol field... let's use RTP pt
-                        (void)pt;
-                        __android_log_print(ANDROID_LOG_INFO, "rxd-health",
-                            "rx=%d dropDup=%d decFail=%d lost=%d (reorder) rxrate=%u",
-                            _dbgRx, _dbgDrop, _dbgDecFail, _dbgLoss,
-                            (unsigned)pkt.RxAtrib.data_rate);
-                    }
-                    processReorder(tid, seq, llc, llcLen);
-                    return;  // handled by reorder — skip duplicate processing
+                if (((u[2] << 8) | u[3]) == 5600) {
+                    processReorder((hdrLen>=26)?(f[24]&0xf):0,
+                        (uint16_t)((f[23]<<4)|(f[22]>>4)), llc, llcLen);
+                    return;
                 }
             }
         }
     }
+    #endif
 
     // ARP responder: reply to "who has <ourIp>?" so peers keep a fresh entry for us and the
     // unicast RTP/SSH stream doesn't stall when their STALE entry needs re-validation.
