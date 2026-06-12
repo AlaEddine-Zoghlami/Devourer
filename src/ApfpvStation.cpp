@@ -723,12 +723,16 @@ bool ApfpvStation::runConnectChain() {
 }
 
 void ApfpvStation::handleAddbaRequest(const uint8_t* frame, size_t len) {
-    if (len < 24 + 3 + 7) return;
+    if (len < 24 + 9) return;  // mgmt hdr + ADDBA Request body (cat+act+tok+param+timeout+start_seq)
     const uint8_t* body = frame + 24;  // skip 3-addr mgmt header
     u8  dialog = body[2];
     u16 param  = body[3] | (body[4] << 8);
-    u16 tid    = (param >> 2) & 0x0f;  // TID from BA Parameter Set
-    (void)tid;
+    u8  tid    = (param >> 2) & 0x0f;  // TID from BA Parameter Set
+    // Debounce: only respond ONCE per TID per connection epoch. The AP retries when
+    // our response is lost; answering every retry creates a TX storm that starves RX.
+    static uint8_t seenTids = 0;
+    if (seenTids & (1 << tid)) return;
+    seenTids |= (1 << tid);
     // Build ADDBA Response: accept TID 0, immediate BA, buffer size 64
     auto& dev = *reinterpret_cast<RtlUsbAdapter*>(_dev);
     MacAddr bssid; for (int i=0;i<6;i++) bssid.b[i] = _params.bssid[i];
