@@ -715,6 +715,53 @@ bool ApfpvStation::runConnectChain() {
                 (int)rt, (int)match, e.size(), dpl.size());
     }
 
+    // Initiate ADDBA Request for TID 0 (video) before DHCP. The kernel's station
+    // sends issue_addba_req to initiate the BA session; the AP responds and starts
+    // A-MPDU. Sending the request AFTER keys are installed ensures it's encrypted
+    // (QoS-data). The response handler in RxDeframe's dispatch catches the reply.
+    {
+        MacAddr bssid; for (int i=0;i<6;i++) bssid.b[i] = _params.bssid[i];
+        std::vector<uint8_t> addba;
+        // 802.11 QoS-Data header (subtype 8, ToDS, Protected)
+        addba.push_back(0x88); addba.push_back(0x41);   // FC: QoS-Data, ToDS, Protected
+        addba.push_back(0x00); addba.push_back(0x00);   // duration
+        addba.insert(addba.end(), bssid.b.data(), bssid.b.data() + 6); // A1=AP BSSID
+        addba.insert(addba.end(), selfMac.begin(), selfMac.end());   // A2=self
+        addba.insert(addba.end(), bssid.b.data(), bssid.b.data() + 6); // A3=AP BSSID
+        addba.push_back(0x00); addba.push_back(0x00);   // seq ctl
+        addba.push_back(0x00); addba.push_back(0x00);   // QoS control (TID=0, normal ACK)
+        // LLC/SNAP: AA AA 03 00 00 00 + EtherType 0x888E (EAPOL... no, action frames
+        // use a different encapsulation. Actually ADDBA is a mgmt action frame, not data.
+        // For mgmt action, use plain mgmt frame (FC=0x00D0), not QoS-Data.
+        // Build as mgmt action frame instead:
+        addba.clear();
+        addba.push_back(0xD0); addba.push_back(0x00);   // FC: mgmt, action
+        addba.push_back(0x00); addba.push_back(0x00);   // duration
+        addba.insert(addba.end(), bssid.b.data(), bssid.b.data() + 6); // A1=AP
+        addba.insert(addba.end(), selfMac.begin(), selfMac.end());   // A2=self
+        addba.insert(addba.end(), bssid.b.data(), bssid.b.data() + 6); // A3=AP
+        static uint16_t mgmtSeq = 200;  // offset from response seq
+        addba.push_back((u8)(mgmtSeq & 0xff));
+        addba.push_back((u8)((mgmtSeq >> 4) & 0xff));
+        mgmtSeq++;
+        // ADDBA Request body (matches kernel issue_addba_req)
+        addba.push_back(0x03); // Category: Block Ack
+        addba.push_back(0x00); // Action: ADDBA Request
+        addba.push_back(0x01); // Dialog token
+        // BA Parameter Set: TID=0, buf=64, immediate BA
+        addba.push_back(0x00); // low byte: TID=0, amsdu=0, buf[5:7]=0
+        addba.push_back(0x08); // high byte: buf[3:0]=0b0000, policy=0(immediate)
+        addba.push_back(0x00); addba.push_back(0x00); // BA Timeout: 0 (default)
+        addba.push_back(0x00); addba.push_back(0x00); // BA Starting Seq: 0 (any)
+        // Send with TX descriptor (same as ADDBA Response)
+        std::vector<uint8_t> txf(40 + addba.size(), 0);
+        std::memcpy(txf.data() + 40, addba.data(), addba.size());
+        apfpv::FillStationTxDesc(txf.data(), (uint16_t)addba.size(), 40,
+                                 1, apfpv::StationFrameKind::Mgmt, 0x0c, 0x04);
+        dev.sendStationFrameSync(txf.data(), txf.size());
+        SCANLOG("ADDBA Request sent for TID 0 (initiating BA session)");
+    }
+
     // Keys installed -> DHCP (or static). For dynamic, wait briefly for the lease.
     set(State::Dhcp);
     if (_params.staticIp) _dhcp->claimStatic(_params.staticIp, _params.staticNetmask, _params.staticGateway);
