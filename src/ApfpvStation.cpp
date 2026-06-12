@@ -400,6 +400,7 @@ static std::vector<uint8_t> buildTcp(uint32_t srcIp, uint32_t dstIp, uint16_t sp
 // Returns true only on a held, streaming link. Used for both initial connect
 // AND each supervisor reconnect attempt.
 bool ApfpvStation::runConnectChain() {
+    _pendingAddbaTids = 0;  // fresh ADDBA debounce per connection
     auto& dev = *reinterpret_cast<RtlUsbAdapter*>(_dev);
     auto& rm  = *reinterpret_cast<RadioManagementModule*>(_rm);
     auto sendFrame = [&dev](const std::vector<uint8_t>& f) {
@@ -701,6 +702,36 @@ bool ApfpvStation::runConnectChain() {
         }
     }
 
+    // mac80211 __ieee80211_start_rx_ba_session: send all pending ADDBA Responses
+    // in ONE batch with a single RX pause (same TX path as auth/assoc). Pausing
+    // separately for each TID killed the link (8×~200ms silence = AP drops us).
+    if (_pendingAddbaTids && !std::getenv("DEVOURER_SKIP_ADDBA")) {
+        MacAddr ba; for (int i=0;i<6;i++) ba.b[i] = _params.bssid[i];
+        dev.pauseAsyncRx();  // single pause for clean TX
+        for (u8 tid = 0; tid < 8; tid++) {
+            if (!(_pendingAddbaTids & (1 << tid))) continue;
+            std::vector<uint8_t> r;
+            r.push_back(0xD0); r.push_back(0x00); r.push_back(0x00); r.push_back(0x00);
+            r.insert(r.end(), ba.b.data(), ba.b.data()+6);
+            for (int i=0;i<6;i++) r.push_back(dev.rtw_read8(0x0610+i));
+            r.insert(r.end(), ba.b.data(), ba.b.data()+6);
+            static uint16_t s=0; s++; r.push_back(s&0xff); r.push_back((s>>4)&0xff);
+            r.push_back(0x03); r.push_back(0x01); r.push_back(0x01);
+            r.push_back(0x00); r.push_back(0x00);
+            u16 bp = ((u16)tid<<2)|((u16)64<<6);
+            r.push_back(bp&0xff); r.push_back(bp>>8);
+            r.push_back(0x00);r.push_back(0x00);r.push_back(0x00);r.push_back(0x00);
+            std::vector<uint8_t> t(40+r.size(),0);
+            std::memcpy(t.data()+40, r.data(), r.size());
+            apfpv::FillStationTxDesc(t.data(), (uint16_t)r.size(), 40,
+                                     1, apfpv::StationFrameKind::Mgmt, 0x0c, 0x04);
+            dev.sendStationFrameSync(t.data(), t.size());
+            SCANLOG("ADDBA tid=%u (batch+pause)", tid);
+        }
+        _pendingAddbaTids = 0;
+        dev.resumeAsyncRx();
+    }
+
     // ENCRYPT round-trip self-test: encrypt a dummy IPv4/UDP datagram, then decrypt it through
     // the proven-standard decrypt path. roundtrip+match => our CCMP ENCRYPT is standard (so a
     // dropped uplink is a framing/DHCP issue, not crypto); fail => the encrypt itself is wrong.
@@ -863,15 +894,10 @@ void ApfpvStation::handleAddbaRequest(const uint8_t* frame, size_t len) {
     rsp.push_back((u8)(param & 0xff));
     rsp.push_back((u8)(param >> 8));
     rsp.push_back(0x00); rsp.push_back(0x00);   // BA Timeout: 0 = default
-    // Prepend 40-byte TX descriptor (required for on-air radiation — the raw frame
-    // alone would be read as a partial descriptor, garbling the transmission).
-    // Use MACID=1 (mgmt), RAID=0x0c (HT-mixed), rate=0x04 (OFDM-6M for 5GHz).
-    std::vector<uint8_t> txf(40 + rsp.size(), 0);
-    std::memcpy(txf.data() + 40, rsp.data(), rsp.size());
-    apfpv::FillStationTxDesc(txf.data(), (uint16_t)rsp.size(), 40,
-                             1, apfpv::StationFrameKind::Mgmt, 0x0c, 0x04);
-    dev.sendStationFrameSync(txf.data(), txf.size());
-    SCANLOG("ADDBA Response sent (accepted TID=%u buffsize=%u)", tid & 0x0f, 64);
+    // mac80211 ieee80211_send_addba_resp() -> ieee80211_tx_skb(): software TX.
+    // Queue the TID; all responses sent in ONE batch after the first arrives,
+    // with a single RX pause (minimizes disruption — 8 separate pauses killed link).
+    _pendingAddbaTids |= (1 << tid);
 }
 
 bool ApfpvStation::connect(const Params& p) {

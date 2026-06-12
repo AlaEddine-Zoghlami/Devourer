@@ -145,6 +145,7 @@ private:
     std::atomic<State> _state{State::Idle};
     std::atomic<int> _rssi{-90};
     std::atomic<int64_t> _lastRxMs{0};
+    uint8_t _pendingAddbaTids = 0;          // TIDs queued by dispatch, sent from connect thread
     std::atomic<bool> _deauth{false};
     std::atomic<bool> _run{false};   // supervisor running
     std::thread _supervisor;
