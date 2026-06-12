@@ -57,6 +57,19 @@ void RxDeframe::onPacket(const Packet& pkt) {
             return;
         }
         // 802.11 Action frame (subtype 0xD): BlockAck frames
+        if (sub == 0xD && len >= 27) {
+            const uint8_t* b = f + 24;
+            // Full hex dump of ADDBA Request (cat=3 act=0) to compare buffer size/policy
+            if (b[0] == 0x03 && b[1] == 0x00 && len >= 24 + 9) {
+                u16 p = b[3] | (b[4] << 8);
+                __android_log_print(4, "apfpv-scan",
+                    "ADDBA-REQ-IN dialog=%u param=0x%04x policy=%u tid=%u bufsz=%u timeout=%u startSeq=%u",
+                    b[2], p, (p>>1)&1, (p>>2)&0x0f, (p>>6)&0x3ff,
+                    b[5]|(b[6]<<8), (b[7]|(b[8]<<8))>>4);
+            } else {
+                __android_log_print(4, "apfpv-scan", "ACTION-RX cat=%u act=%u", b[0], b[1]);
+            }
+        }
         if (sub == 0xD && _station && len >= 24 + 3) {
             const uint8_t* body = f + 24; // 3-addr mgmt header
             if (body[0] == 0x03) { // BlockAck category

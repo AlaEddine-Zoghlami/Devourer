@@ -702,34 +702,16 @@ bool ApfpvStation::runConnectChain() {
         }
     }
 
-    // mac80211 __ieee80211_start_rx_ba_session: send all pending ADDBA Responses
-    // in ONE batch with a single RX pause (same TX path as auth/assoc). Pausing
-    // separately for each TID killed the link (8×~200ms silence = AP drops us).
-    if (_pendingAddbaTids && !std::getenv("DEVOURER_SKIP_ADDBA")) {
-        MacAddr ba; for (int i=0;i<6;i++) ba.b[i] = _params.bssid[i];
-        dev.pauseAsyncRx();  // single pause for clean TX
-        for (u8 tid = 0; tid < 8; tid++) {
-            if (!(_pendingAddbaTids & (1 << tid))) continue;
-            std::vector<uint8_t> r;
-            r.push_back(0xD0); r.push_back(0x00); r.push_back(0x00); r.push_back(0x00);
-            r.insert(r.end(), ba.b.data(), ba.b.data()+6);
-            for (int i=0;i<6;i++) r.push_back(dev.rtw_read8(0x0610+i));
-            r.insert(r.end(), ba.b.data(), ba.b.data()+6);
-            static uint16_t s=0; s++; r.push_back(s&0xff); r.push_back((s>>4)&0xff);
-            r.push_back(0x03); r.push_back(0x01); r.push_back(0x01);
-            r.push_back(0x00); r.push_back(0x00);
-            u16 bp = ((u16)tid<<2)|((u16)64<<6);
-            r.push_back(bp&0xff); r.push_back(bp>>8);
-            r.push_back(0x00);r.push_back(0x00);r.push_back(0x00);r.push_back(0x00);
-            std::vector<uint8_t> t(40+r.size(),0);
-            std::memcpy(t.data()+40, r.data(), r.size());
-            apfpv::FillStationTxDesc(t.data(), (uint16_t)r.size(), 40,
-                                     1, apfpv::StationFrameKind::Mgmt, 0x0c, 0x04);
-            dev.sendStationFrameSync(t.data(), t.size());
-            SCANLOG("ADDBA tid=%u (batch+pause)", tid);
-        }
-        _pendingAddbaTids = 0;
-        dev.resumeAsyncRx();
+    // Kernel writes AMPDU params UNCONDITIONALLY after association (rtw_wlan_util.c
+    // :2095-2098), NOT gated on ADDBA. The AP sends ADDBA Request later (during
+    // streaming) — handleAddbaRequest answers it immediately. But the HW must already
+    // know the AMPDU spacing/length BEFORE the BA session starts, else it can't
+    // generate the SIFS Block-Ack for aggregates. Write these now.
+    if (!std::getenv("DEVOURER_SKIP_ADDBA")) {
+        dev.rtw_write8(0x045C, 7);                    // REG_AMPDU_MIN_SPACE = 16µs
+        uint32_t al = dev.rtw_read32(0x0456);
+        dev.rtw_write32(0x0456, al | 0x80000000);     // AMPDU_MAX_LENGTH BIT31 = enable RX
+        SCANLOG("AMPDU HW: MIN_SPACE=7 MAX_LEN=0x%08x", al | 0x80000000);
     }
 
     // ENCRYPT round-trip self-test: encrypt a dummy IPv4/UDP datagram, then decrypt it through
@@ -869,11 +851,10 @@ void ApfpvStation::handleAddbaRequest(const uint8_t* frame, size_t len) {
     u8  dialog = body[2];
     u16 param  = body[3] | (body[4] << 8);
     u8  tid    = (param >> 2) & 0x0f;  // TID from BA Parameter Set
-    // Debounce: only respond ONCE per TID per connection epoch. The AP retries when
-    // our response is lost; answering every retry creates a TX storm that starves RX.
-    static uint8_t seenTids = 0;
-    if (seenTids & (1 << tid)) return;
-    seenTids |= (1 << tid);
+    // Debounce: only respond ONCE per TID per connection epoch (via the member
+    // _pendingAddbaTids, reset in runConnectChain). The AP retries when our response
+    // is lost; answering every retry creates a TX storm that starves RX.
+    if (_pendingAddbaTids & (1 << tid)) return;
     // Build ADDBA Response: accept TID 0, immediate BA, buffer size 64
     auto& dev = *reinterpret_cast<RtlUsbAdapter*>(_dev);
     MacAddr bssid; for (int i=0;i<6;i++) bssid.b[i] = _params.bssid[i];
@@ -894,9 +875,25 @@ void ApfpvStation::handleAddbaRequest(const uint8_t* frame, size_t len) {
     rsp.push_back((u8)(param & 0xff));
     rsp.push_back((u8)(param >> 8));
     rsp.push_back(0x00); rsp.push_back(0x00);   // BA Timeout: 0 = default
+    rsp.push_back(body[7]); rsp.push_back(body[8]); // BA Starting Seq (mirror request)
     // mac80211 ieee80211_send_addba_resp() -> ieee80211_tx_skb(): software TX.
-    // Queue the TID; all responses sent in ONE batch after the first arrives,
-    // with a single RX pause (minimizes disruption — 8 separate pauses killed link).
+    // Send NOW (debounced once per TID via seenTids above, so at most 8 brief pauses
+    // over the whole session — NOT per-frame). The AP sends ADDBA during streaming,
+    // so the batch-in-connect path never catches it; respond here directly.
+    std::vector<uint8_t> txf(40 + rsp.size(), 0);
+    std::memcpy(txf.data() + 40, rsp.data(), rsp.size());
+    apfpv::FillStationTxDesc(txf.data(), (uint16_t)rsp.size(), 40,
+                             1, apfpv::StationFrameKind::Mgmt, 0x0c, 0x04);
+    dev.pauseAsyncRx();
+    dev.sendStationFrameSync(txf.data(), txf.size());
+    dev.resumeAsyncRx();
+    // Dump our outgoing ADDBA Response body bytes (24 = after mgmt hdr) to compare
+    // with what the kernel sends — buffer size / policy / status must satisfy the AP.
+    { const uint8_t* rb = rsp.data() + 24;
+      u16 rp = rb[5] | (rb[6] << 8);
+      SCANLOG("ADDBA-RSP-OUT dialog=%u status=%u param=0x%04x policy=%u tid=%u bufsz=%u",
+        rb[2], rb[3]|(rb[4]<<8), rp, (rp>>1)&1, (rp>>2)&0x0f, (rp>>6)&0x3ff); }
+    SCANLOG("ADDBA Response SENT tid=%u dialog=%u (immediate, debounced)", tid, dialog);
     _pendingAddbaTids |= (1 << tid);
 }
 
