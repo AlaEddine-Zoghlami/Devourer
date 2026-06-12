@@ -57,6 +57,11 @@ void RxDeframe::onPacket(const Packet& pkt) {
             return;
         }
         // 802.11 Action frame (subtype 0xD): BlockAck frames
+        if (sub == 0xD && len >= 27) {
+            const uint8_t* b = f + 24;
+            __android_log_print(4, "apfpv-scan", "ACTION-RX cat=%u act=%u a1=%02x:%02x:%02x:%02x:%02x:%02x",
+                b[0], b[1], f[4],f[5],f[6],f[7],f[8],f[9]);
+        }
         if (sub == 0xD && _station && len >= 24 + 3) {
             const uint8_t* body = f + 24; // 3-addr mgmt header
             if (body[0] == 0x03) { // BlockAck category
@@ -110,6 +115,24 @@ void RxDeframe::onPacket(const Packet& pkt) {
         llc = plainBuf.data(); llcLen = plainBuf.size();
     } else { llc = body; llcLen = bodyLen; }
     auto t1 = std::chrono::steady_clock::now();   // after CCMP decrypt (or skip)
+
+    // Software Block-Ack tracking (mac80211 does this in software for A-MPDU).
+    // Track received 802.11 sequence numbers per TID; send BA every ~16 frames.
+    if ((fc & 0x0080) && _baSend) { // QoS-data
+        uint16_t seq80211 = (uint16_t)((f[23] << 4) | (f[22] >> 4));
+        uint8_t  tid = (hdrLen >= 26) ? (f[24] & 0x0f) : 0;
+        if (tid < 16 && seq80211 < 4096) {
+            auto& s = _baSessions[tid];
+            if (!s.active) { s.active = true; s.startSeq = seq80211; s.bitmap = 0; s.count = 0; }
+            uint16_t off = (seq80211 - s.startSeq) & 0xFFF;
+            if (off < 64) { s.bitmap |= (1ULL << off); s.count++; }
+            // Send BA every 64 frames or when bitmap fills (>60 of 64 slots used)
+            if (s.count >= 64 || off >= 62) {
+                sendSoftwareBA(tid);
+                s.active = false;
+            }
+        }
+    }
 
     if (llcLen < 8) return;
     static const uint8_t snap[6] = {0xaa,0xaa,0x03,0x00,0x00,0x00};
@@ -370,6 +393,41 @@ bool RxDeframe::processReorder(uint8_t tid, uint16_t seq, const uint8_t* llc, si
         }
     }
     return true;
+}
+
+// Software Block-Ack: build and send a compressed BlockAck control frame for TID `tid`.
+// This is what mac80211 does in software — the HW (FORCEACK) only handles single-frame ACK.
+// For A-MPDU, we must build the BA bitmap from received subframes and TX the BA frame.
+// The BA is a 28-byte control frame: FC(2) + Dur(2) + RA(6) + TA(6) + BACtrl(2) + SSN(2) + Bitmap(8).
+void RxDeframe::sendSoftwareBA(uint8_t tid) {
+    if (!_baSend || tid >= 16) return;
+    auto& s = _baSessions[tid];
+    if (!s.active) return;
+
+    uint8_t ba[28] = {};
+    // Frame Control: Control(01), subtype BlockAck(1001) = 0x0094
+    ba[0] = 0x94; ba[1] = 0x00;
+    // Duration: 0
+    ba[2] = 0x00; ba[3] = 0x00;
+    // RA = AP BSSID
+    std::memcpy(ba + 4, _bssid.data(), 6);
+    // TA = our MAC
+    std::memcpy(ba + 10, _self.data(), 6);
+    // BA Control: TID bits[0:3], Compressed bit[11]
+    uint16_t baCtrl = (tid & 0x0f) | (1u << 11);  // compressed BA
+    ba[16] = (uint8_t)(baCtrl & 0xff);
+    ba[17] = (uint8_t)(baCtrl >> 8);
+    // Starting Sequence Number: 12-bit seq in bits[4:15], fragment=0
+    uint16_t ssn = (s.startSeq << 4) & 0xFFF0;
+    ba[18] = (uint8_t)(ssn & 0xff);
+    ba[19] = (uint8_t)(ssn >> 8);
+    // BlockAck Bitmap: 64 bits LE
+    std::memcpy(ba + 20, &s.bitmap, 8);
+
+    _baSend(ba, sizeof(ba));
+    __android_log_print(4, "apfpv-scan",
+        "SW-BA tid=%u startSeq=%u bitmap=0x%llx",
+        tid, s.startSeq, (unsigned long long)s.bitmap);
 }
 
 } // namespace apfpv

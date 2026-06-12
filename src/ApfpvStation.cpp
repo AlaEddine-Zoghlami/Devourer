@@ -511,6 +511,11 @@ bool ApfpvStation::runConnectChain() {
                     }
                 }
             }
+            // TRACE: log EVERY action frame to see if AP responds to our ADDBA Request
+            if (((fc>>4)&0xF) == 0xD && n >= 27) {
+                const uint8_t* b = f + 24;
+                SCANLOG("ACTION-FRAME cat=%u act=%u", b[0], b[1]);
+            }
             sp->onScanFrame(f, n);                  // beacons -> _scanResult
             std::string ss; ApInfo bi;
             if (ScanProbe::parseAnyBeacon(f, n, ss, bi) && !ss.empty()) {
@@ -679,6 +684,17 @@ bool ApfpvStation::runConnectChain() {
     _rx->setStation(this);
     { ApfpvDhcp* dh = _dhcp.get();
       _rx->setDhcpSink([dh](const uint8_t* b, size_t n){ dh->onBootpReply(b, n); }); }
+    // Software Block-Ack TX: send the BA control frame with RX paused for clean TX.
+    _rx->setBaSend([&dev](const uint8_t* ba, size_t len) {
+        // Non-blocking: send_packet submits the OUT URB and returns immediately.
+        // The BA frame is short (28 bytes) and the HW will TX it at next opportunity.
+        // Must NOT block the dispatch thread (sendStationFrameSync polls TXPKT_EMPTY).
+        std::vector<uint8_t> txf(40 + len, 0);
+        std::memcpy(txf.data() + 40, ba, len);
+        apfpv::FillStationTxDesc(txf.data(), (uint16_t)len, 40,
+                                 0, apfpv::StationFrameKind::Mgmt, 0x0c, 0x04);
+        dev.send_packet(txf.data(), txf.size());
+    });
     if (_ipSink) _rx->setIpSink(_ipSink);   // general-IP downlink -> VpnService TUN (SSH etc.)
     // Switch the ALREADY-RUNNING RX thread to the streaming path — do NOT re-Init
     // (that blocks). EAPOL (handshake), DHCP replies, and RTP now route through

@@ -23,18 +23,20 @@ public:
     // TCP+UDP traverses the dongle — not just RTP. The OS then routes it (RTP->5600, SSH->22).
     using OnIpFn = std::function<void(const uint8_t*, size_t)>;
     void setIpSink(OnIpFn fn) { _onIp = std::move(fn); }
-    // ARP responder: answer "who has <ourIp>?" so peers (the VTX unicasting RTP video, SSH,
-    // ...) keep a FRESH ARP entry for us — without it a STALE entry fails to re-validate and
-    // the unicast stream stops after a frame or two. send() gets the encrypted ARP-reply MPDU.
+    // ARP responder: answer "who has <ourIp>?"
     void setArp(uint32_t ourIp, std::function<void(const std::vector<uint8_t>&)> send) {
         _ourIp = ourIp; _arpSend = std::move(send);
     }
+    // Software Block-Ack: send a raw 802.11 control frame (the BA response) through
+    // the TX path. Called from onPacket when A-MPDU subframes need a BA response.
+    void setBaSend(std::function<void(const uint8_t*, size_t)> send) { _baSend = std::move(send); }
 private:
     static int toDbm(uint8_t r);
     Mac _self, _bssid; Wpa2Supplicant* _wpa; LqFeedback* _lq; OnRtpFn _onRtp;
     OnDhcpFn _onDhcp; OnIpFn _onIp;
     uint32_t _ourIp = 0;
     std::function<void(const std::vector<uint8_t>&)> _arpSend;
+    std::function<void(const uint8_t*, size_t)> _baSend;  // software Block-Ack TX
     ApfpvStation* _station = nullptr;
     // Per-payload-type recent-RTP-seq window for dropping 802.11-retransmit duplicates
     // (reordered retransmits need a window, not just the previous seq) + debug counters.
@@ -60,6 +62,17 @@ private:
         std::map<uint16_t, std::vector<uint8_t>> pending; // seq -> plaintext frame
     };
     ReorderCtl _reorder[16];  // one per TID (0-15)
+    // Software Block-Ack session per TID (mac80211 does this in software).
+    // Tracks received sequence numbers and generates BA response frames.
+    struct BaSession {
+        bool     active = false;
+        uint16_t startSeq = 0;      // first seq in the BA window
+        uint64_t bitmap = 0;        // 64 bits, bit N = received seq (startSeq+N)
+        int      count = 0;         // frame count since last BA sent
+    };
+    BaSession _baSessions[16];
+    // Build and send a compressed Block-Ack control frame for TID `tid`.
+    void sendSoftwareBA(uint8_t tid);
     // Process a decrypted QoS-data frame through the reorder buffer for TID `tid`.
     // Delivers frames in-order via onRtpFn. Returns true if delivered, false if queued/dropped.
     bool processReorder(uint8_t tid, uint16_t seq, const uint8_t* llc, size_t llcLen);
