@@ -103,6 +103,37 @@ void RxDeframe::onPacket(const Packet& pkt) {
         if (_wpa) _wpa->onEapolKey(llc + 8, llcLen - 8);
         return;
     }
+    // A-MPDU reorder for QoS-data video frames (IPv4/UDP/5600). Pass-through
+    // for in-order frames; reorders out-of-order A-MPDU subframes. Non-video
+    // frames (ARP, DHCP, EAPOL, etc.) use the existing direct path below.
+    if ((fc & 0x0088) == 0x0088 && ethertype == 0x0800 && llcLen >= 28) {
+        // Quick check: is this likely a video RTP frame destined for port 5600?
+        const uint8_t* ip = llc + 8;
+        size_t ipl = llcLen - 8;
+        if (ipl >= 20 && (ip[0] >> 4) == 4 && ip[9] == 17) {  // IPv4 + UDP
+            size_t ihl = (ip[0] & 0x0f) * 4;
+            if (ipl >= ihl + 8) {
+                const uint8_t* u = ip + ihl;
+                if (((u[2] << 8) | u[3]) == 5600) {  // RTP port
+                    uint8_t tid = (hdrLen >= 26) ? (f[24] & 0x0f) : 0;
+                    uint16_t seq = (uint16_t)((f[23] << 4) | (f[22] >> 4));
+                    _dbgRx++;
+                    // Health summary every 120 pkts (same interval as old path)
+                    if ((_dbgRx % 120) == 0) {
+                        uint8_t pt = ip[9]; // actually protocol field... let's use RTP pt
+                        (void)pt;
+                        __android_log_print(ANDROID_LOG_INFO, "rxd-health",
+                            "rx=%d dropDup=%d decFail=%d lost=%d (reorder) rxrate=%u",
+                            _dbgRx, _dbgDrop, _dbgDecFail, _dbgLoss,
+                            (unsigned)pkt.RxAtrib.data_rate);
+                    }
+                    processReorder(tid, seq, llc, llcLen);
+                    return;  // handled by reorder — skip duplicate processing
+                }
+            }
+        }
+    }
+
     // ARP responder: reply to "who has <ourIp>?" so peers keep a fresh entry for us and the
     // unicast RTP/SSH stream doesn't stall when their STALE entry needs re-validation.
     if (ethertype == 0x0806 && _ourIp && _arpSend && _wpa && llcLen >= 8 + 28) {
@@ -205,6 +236,122 @@ void RxDeframe::onPacket(const Packet& pkt) {
             _diagTotalNs = _diagDecNs = _diagFwdNs = _diagPkts = 0;
         }
     }
+}
+
+// A-MPDU per-TID reorder buffer (kernel: recv_indicatepkt_reorder).
+// Delivers frames in-order within a sliding window of 64 seq numbers.
+// QoS data frames from A-MPDU aggregates may arrive out-of-order; without
+// this buffer, the RTP stream would see corrupted/unordered NALUs.
+// 12-bit sequence space (802.11 QoS), modulo 4096.
+bool RxDeframe::processReorder(uint8_t tid, uint16_t seq, const uint8_t* llc, size_t llcLen) {
+    if (tid >= 16) return false;
+    auto& rc = _reorder[tid];
+    uint16_t sq = seq & 0xfff;  // 12-bit sequence number
+
+    // First frame on this TID: initialize window at this seq.
+    if (!rc.enable) {
+        rc.enable = true;
+        rc.indicate_seq = sq;
+        rc.pending.clear();
+    }
+
+    uint16_t ind = rc.indicate_seq;
+
+    // Already delivered or too old (outside window, below indicate_seq).
+    // Sequence comparison with 12-bit wrap: (a - b) mod 4096.
+    int16_t sn_diff = (int16_t)(sq - ind);
+    if (sn_diff < 0) {
+        // Too old — already passed this seq. Drop.
+        return false;
+    }
+
+    // In-order: deliver immediately.
+    if (sn_diff == 0) {
+        // Deliver this frame
+        if (llcLen >= 8 && _onRtp) {
+            const uint8_t* ip = llc + 8;  // skip SNAP header
+            size_t ipl = llcLen - 8;
+            // Quick IP/UDP/RTP extraction (same as main onPacket path)
+            if (ipl >= 20 && (ip[0] >> 4) == 4) {
+                size_t ihl = (ip[0] & 0x0f) * 4;
+                if (ipl >= ihl + 8 && ip[9] == 17) {  // UDP
+                    const uint8_t* u = ip + ihl;
+                    uint16_t dport = (u[2] << 8) | u[3];
+                    if (dport == 5600) {
+                        const uint8_t* rtp = u + 8;
+                        size_t rtpLen = (u[4] << 8) | u[5];
+                        if (rtpLen >= 8 && (size_t)(rtpLen) <= ipl - ihl)
+                            _onRtp(rtp, rtpLen);
+                    }
+                }
+            }
+        }
+
+        // Advance window to next expected seq
+        rc.indicate_seq = (ind + 1) & 0xfff;
+
+        // Drain pending queue: deliver any consecutive buffered frames
+        while (!rc.pending.empty()) {
+            auto it = rc.pending.begin();
+            uint16_t next_ind = rc.indicate_seq;
+            if (it->first == next_ind) {
+                // Deliver queued frame (IP/UDP/RTP extraction similar to above)
+                auto& buf = it->second;
+                if (buf.size() >= 8) {
+                    const uint8_t* ip = buf.data() + 8;
+                    size_t ipl = buf.size() - 8;
+                    if (ipl >= 20 && (ip[0] >> 4) == 4) {
+                        size_t ihl = (ip[0] & 0x0f) * 4;
+                        if (ipl >= ihl + 8 && ip[9] == 17) {
+                            const uint8_t* u = ip + ihl;
+                            uint16_t dport = (u[2] << 8) | u[3];
+                            if (dport == 5600) {
+                                const uint8_t* rtp = u + 8;
+                                size_t rtpLen = (u[4] << 8) | u[5];
+                                if (rtpLen >= 8 && (size_t)(rtpLen) <= ipl - ihl && _onRtp)
+                                    _onRtp(rtp, rtpLen);
+                            }
+                        }
+                    }
+                }
+                rc.indicate_seq = (next_ind + 1) & 0xfff;
+                rc.pending.erase(it);
+            } else {
+                break;  // gap in pending queue — wait for the missing frame
+            }
+        }
+        return true;
+    }
+
+    // Out-of-order but within window: buffer for later delivery.
+    if (sn_diff < (int16_t)rc.wsize_b) {
+        // Check if already queued (duplicate)
+        if (rc.pending.count(sq) > 0) return false;
+        rc.pending[sq] = std::vector<uint8_t>(llc, llc + llcLen);
+        return false;  // queued, not delivered yet
+    }
+
+    // Outside window — too far ahead. Advance window and deliver.
+    // (This handles the case where many frames were dropped and we need to skip ahead.)
+    rc.indicate_seq = (sq + 1) & 0xfff;
+    rc.pending.clear();  // discard stale pending frames
+    if (llcLen >= 8 && _onRtp) {
+        const uint8_t* ip = llc + 8;
+        size_t ipl = llcLen - 8;
+        if (ipl >= 20 && (ip[0] >> 4) == 4) {
+            size_t ihl = (ip[0] & 0x0f) * 4;
+            if (ipl >= ihl + 8 && ip[9] == 17) {
+                const uint8_t* u = ip + ihl;
+                if (((u[2] << 8) | u[3]) == 5600) {
+                    const uint8_t* rtp = u + 8;
+                    size_t rtpLen = (u[4] << 8) | u[5];
+                    if (rtpLen >= 8 && (size_t)(rtpLen) <= ipl - ihl)
+                        _onRtp(rtp, rtpLen);
+                }
+            }
+        }
+    }
+    return true;
 }
 
 } // namespace apfpv

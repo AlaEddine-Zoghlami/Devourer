@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <array>
+#include <map>
 #include <functional>
 #include "FrameParser.h"
 #include "Wpa2Supplicant.h"
@@ -49,5 +50,18 @@ private:
     // Bottleneck diag: cumulative time (ns) spent in onPacket phases per interval
     int64_t  _diagTotalNs = 0, _diagDecNs = 0, _diagFwdNs = 0;
     int      _diagPkts = 0;
+    // A-MPDU RX reorder buffer (kernel: recv_indicatepkt_reorder).
+    // Per-TID sliding window for in-order delivery of A-MPDU subframes.
+    // Without this, out-of-order subframes are dropped -> video corruption.
+    struct ReorderCtl {
+        bool     enable = false;
+        uint16_t indicate_seq = 0xffff;  // next expected seq (mod 4096)
+        uint8_t  wsize_b = 64;            // window size in frames
+        std::map<uint16_t, std::vector<uint8_t>> pending; // seq -> plaintext frame
+    };
+    ReorderCtl _reorder[16];  // one per TID (0-15)
+    // Process a decrypted QoS-data frame through the reorder buffer for TID `tid`.
+    // Delivers frames in-order via onRtpFn. Returns true if delivered, false if queued/dropped.
+    bool processReorder(uint8_t tid, uint16_t seq, const uint8_t* llc, size_t llcLen);
 };
 }
