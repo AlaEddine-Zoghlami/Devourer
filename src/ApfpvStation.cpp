@@ -437,17 +437,20 @@ bool ApfpvStation::runConnectChain() {
         sta._alivePtr = alive;
         StationMode* sp = &sta;
         auto dispatch = [sp, this, alive](const Packet& pkt){
-            if (!alive->load()) return;  // StationMode destroyed — TOCTOU-safe
             _rxReady.store(true);
             if (_rxPhase.load() == 1) {
-                const uint8_t* df = pkt.Data.data();
-                if (pkt.Data.size() >= 2) {
-                    uint16_t dfc = (uint16_t)(df[0] | (df[1] << 8));
-                    fprintf(stderr, "[disp1] fc=0x%04x type=%d sub=%d len=%zu\n",
-                            dfc, (dfc>>2)&3, (dfc>>4)&0xF, pkt.Data.size());
-                }
+                // STREAMING/handshake path: routes to RxDeframe via _rx (owned by ApfpvStation,
+                // outlives the per-attempt StationMode). MUST NOT be gated by `alive`: when
+                // runConnectChain returns at the Streaming transition, the local `sta` is
+                // destroyed (alive=false) — gating here dropped EVERY data frame -> RX silence
+                // -> watchdog -> reconnect loop. RxDeframe doesn't touch `sp`, so it's safe.
+                // NOTE: NO per-packet fprintf here — at 65Mbps that's 5600 blocking writes/s on
+                // the RX dispatch thread, which stalls RX and shreds frame assembly.
                 RxDeframe* rx = _rx.get(); if (rx) rx->onPacket(pkt); return;
             }
+            // DISCOVERY/ARM path below calls into `sp` (the StationMode). Guard it: if `sta`
+            // was destroyed, sp is dangling — TOCTOU-safe via the shared `alive` flag.
+            if (!alive->load()) return;
             size_t n = pkt.Data.size();
             if (n < 24 || n > 4096) return;
             // Copy the frame off the RX span before parsing: pkt.Data points into the
@@ -539,9 +542,12 @@ bool ApfpvStation::runConnectChain() {
         if (!ap.found) { set(State::FailNoAp); return false; }
         bssid.b = ap.bssid;
         _params.channel = ap.channel ? ap.channel : _params.channel;
-        // Save BSSID so reconnects skip the scan (avoid scan crash at high bitrate)
-        _params.haveBssid = true;
-        for (int i = 0; i < 6; ++i) _params.bssid[i] = ap.bssid.data()[i];
+        // NOTE: do NOT set _params.haveBssid here. Persisting it made every
+        // supervisor RECONNECT skip the scan and jump straight to auth — and the
+        // auth TX then FAILS (arm result 3 = TXFAIL_NoAuth), looping forever. The
+        // scan both re-confirms the channel AND warms the TX path; the parseBeacon
+        // crash it was meant to avoid is now covered by the _alive guard + try/catch.
+        // haveBssid stays reserved for explicit phone-assisted connect only.
         sta.setNegotiatedCipher(ScanProbe::chooseCipher(ap.pairwise),
                                 ap.rsnPresent ? ap.groupCipher : 0x000FAC04);
         SCANLOG("CIPHERS: pairwise=0x%08x group=0x%08x (CCMP=0x000FAC04 TKIP=0x000FAC02)",
@@ -663,9 +669,13 @@ bool ApfpvStation::runConnectChain() {
             }
             std::this_thread::sleep_for(milliseconds(20));
         }
-        { uint32_t ip=_dhcp->lease().ip;
+        { uint32_t ip=_dhcp->lease().ip, sv=_dhcp->lease().server;
           fprintf(stderr, "[dhcp] DORA done: valid=%d ip=%u.%u.%u.%u\n", (int)_dhcp->lease().valid,
-                  (ip>>24)&255,(ip>>16)&255,(ip>>8)&255,ip&255); }
+                  (ip>>24)&255,(ip>>16)&255,(ip>>8)&255,ip&255);
+          // ALSO to logcat (stderr is invisible there): this is the IP to stream RTP to.
+          SCANLOG("DHCP lease valid=%d ip=%u.%u.%u.%u server=%u.%u.%u.%u  <-- stream RTP here",
+                  (int)_dhcp->lease().valid, (ip>>24)&255,(ip>>16)&255,(ip>>8)&255,ip&255,
+                  (sv>>24)&255,(sv>>16)&255,(sv>>8)&255,sv&255); }
         if (!_dhcp->lease().valid) _dhcp->claimStatic_192_168_0_10();  // fallback
     }
 
