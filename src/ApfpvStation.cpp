@@ -511,11 +511,6 @@ bool ApfpvStation::runConnectChain() {
                     }
                 }
             }
-            // TRACE: log EVERY action frame to see if AP responds to our ADDBA Request
-            if (((fc>>4)&0xF) == 0xD && n >= 27) {
-                const uint8_t* b = f + 24;
-                SCANLOG("ACTION-FRAME cat=%u act=%u", b[0], b[1]);
-            }
             sp->onScanFrame(f, n);                  // beacons -> _scanResult
             std::string ss; ApInfo bi;
             if (ScanProbe::parseAnyBeacon(f, n, ss, bi) && !ss.empty()) {
@@ -684,19 +679,6 @@ bool ApfpvStation::runConnectChain() {
     _rx->setStation(this);
     { ApfpvDhcp* dh = _dhcp.get();
       _rx->setDhcpSink([dh](const uint8_t* b, size_t n){ dh->onBootpReply(b, n); }); }
-    // Software Block-Ack TX: send the BA control frame with RX paused for clean TX.
-    _rx->setBaSend([this](const uint8_t* ba, size_t len) {
-        // Enqueue into dedicated BA TX queue — processed by baTxLoop thread.
-        // The dispatch thread must NEVER block; the TX thread handles pausing RX.
-        std::lock_guard<std::mutex> lk(_baMtx);
-        _baQueue.emplace_back(ba, ba + len);
-        _baCv.notify_one();
-    });
-    // BA TX thread disabled — HW auto-generates BA at SIFS via FORCEACK.
-    // SW-BA implementation is ready; re-enable when needed.
-    // if (!_baRun.exchange(true)) {
-    //     _baThread = std::thread(&ApfpvStation::baTxLoop, this);
-    // }
     if (_ipSink) _rx->setIpSink(_ipSink);   // general-IP downlink -> VpnService TUN (SSH etc.)
     // Switch the ALREADY-RUNNING RX thread to the streaming path — do NOT re-Init
     // (that blocks). EAPOL (handshake), DHCP replies, and RTP now route through
@@ -918,36 +900,6 @@ void ApfpvStation::handleAddbaRequest(const uint8_t* frame, size_t len) {
     _pendingAddbaTids |= (1 << tid);
 }
 
-// Dedicated Block-Ack TX worker (kernel-style: separate from RX dispatch).
-// Drains queued BA frames and sends them with a brief RX pause for clean TX.
-// This matches the kernel's TX tasklet — TX and RX are independent.
-void ApfpvStation::baTxLoop() {
-    while (_baRun.load()) {
-        // Collect queued BA frames (block until at least one arrives)
-        std::vector<std::vector<uint8_t>> batch;
-        {
-            std::unique_lock<std::mutex> lk(_baMtx);
-            _baCv.wait(lk, [this]{ return !_baQueue.empty() || !_baRun.load(); });
-            if (!_baRun.load()) break;
-            while (!_baQueue.empty()) {
-                batch.push_back(std::move(_baQueue.front()));
-                _baQueue.pop_front();
-            }
-        }
-        // Use send_packet from dedicated thread (no RX pause).
-        // The BA thread is separate from RX dispatch — libusb handles
-        // concurrent IN/OUT across different threads.
-        auto& dev = *reinterpret_cast<RtlUsbAdapter*>(_dev);
-        for (auto& ba : batch) {
-            std::vector<uint8_t> txf(40 + ba.size(), 0);
-            std::memcpy(txf.data() + 40, ba.data(), ba.size());
-            apfpv::FillStationTxDesc(txf.data(), (uint16_t)ba.size(), 40,
-                                     0, apfpv::StationFrameKind::Mgmt, 0x0c, 0x04);
-            dev.send_packet(txf.data(), txf.size());
-        }
-    }
-}
-
 bool ApfpvStation::connect(const Params& p) {
     _params = p;
     bool ok = runConnectChain();
@@ -1008,7 +960,6 @@ void ApfpvStation::supervisorLoop() {
 
 void ApfpvStation::disconnect() {
     _run.store(false);
-    _baRun.store(false); _baCv.notify_all();
     // Join-safe: NEVER join the current thread (-> EINVAL "Invalid argument" -> uncaught
     // std::system_error -> SIGABRT, seen on replug when the JNI re-init teardown disconnect
     // races/repeats the Java stopAdapters disconnect), and tolerate an already-reaped thread.
@@ -1017,7 +968,6 @@ void ApfpvStation::disconnect() {
         if (t.get_id() == std::this_thread::get_id()) { t.detach(); return; }
         try { t.join(); } catch (...) { if (t.joinable()) { try { t.detach(); } catch (...) {} } }
     };
-    safeJoin(_baThread);
     safeJoin(_supervisor);
     // Stop the RX: async URB pool (default) + legacy sync read thread.
     if (_rtl) {
