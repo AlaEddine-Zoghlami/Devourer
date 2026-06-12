@@ -46,10 +46,12 @@ static SelectedChannel legalApfpvChannel(int ch, int bwMHz) {
     if (bwMHz >= 80)
         return SelectedChannel{ c, (uint8_t)HAL_PRIME_CHNL_OFFSET_DONT_CARE, CHANNEL_WIDTH_80 };
     if (bwMHz == 40) {
-        // Kernel get_40mhz_center_channel: {36,38} {40,38} {44,46} {48,46}.
-        // Center>primary → secondary ABOVE → UPPER offset (correct for ch36, ch44).
-        uint8_t off = (c == 36 || c == 44) ? (uint8_t)HAL_PRIME_CHNL_OFFSET_UPPER
-                                           : (uint8_t)HAL_PRIME_CHNL_OFFSET_LOWER;
+        // WFB proven 40MHz rule: odd (channel/4) -> LOWER, even -> UPPER.
+        // ch36(9 odd)->LOWER ch40(10 even)->UPPER ch44(11 odd)->LOWER ch48(12 even)->UPPER.
+        uint8_t off = (c > 14) ? (((c / 4) & 1) ? (uint8_t)HAL_PRIME_CHNL_OFFSET_LOWER
+                                                 : (uint8_t)HAL_PRIME_CHNL_OFFSET_UPPER)
+                               : ((c <= 7) ? (uint8_t)HAL_PRIME_CHNL_OFFSET_LOWER
+                                           : (uint8_t)HAL_PRIME_CHNL_OFFSET_UPPER);
         return SelectedChannel{ c, off, CHANNEL_WIDTH_40 };
     }
     return SelectedChannel{ c, (uint8_t)HAL_PRIME_CHNL_OFFSET_DONT_CARE, CHANNEL_WIDTH_20 };
@@ -521,8 +523,20 @@ bool ApfpvStation::runConnectChain() {
             sp->onMgmtFrame(fc, a1, a2);            // auth/assoc/deauth -> flags
         };
         _rxPhase.store(0); _rxReady.store(false);
+        // WFB-style bandwidth from the start: use user-selected bw, not hardcoded 20.
+        // The kernel's init_hw_mlme_ext does the same — sets cur_bwmode before auth.
         uint8_t initCh = (uint8_t)(_params.channel > 0 ? _params.channel : 40);
-        SelectedChannel initSel{ .Channel=initCh, .ChannelOffset=0, .ChannelWidth=CHANNEL_WIDTH_20 };
+        ChannelWidth_t initBw = _params.bandwidth >= 80 ? CHANNEL_WIDTH_80
+                              : _params.bandwidth >= 40 ? CHANNEL_WIDTH_40
+                              : CHANNEL_WIDTH_20;
+        if (std::getenv("DEVOURER_FORCE_20MHZ")) initBw = CHANNEL_WIDTH_20;
+        uint8_t initOff = 0;
+        if (initBw == CHANNEL_WIDTH_40) {
+            // WFB offset rule: LOWER members of 40MHz pairs -> offset LOWER (1), else UPPER (2)
+            if (initCh > 14) initOff = ((initCh / 4) & 1) ? 1 /*LOWER*/ : 2 /*UPPER*/;
+            else             initOff = (initCh <= 7) ? 1 : 2;
+        }
+        SelectedChannel initSel{ .Channel=initCh, .ChannelOffset=initOff, .ChannelWidth=initBw };
         if (std::getenv("DEVOURER_SYNC_IO")) {
             // LEGACY blocking sync RX loop (monopolises libusb -> async TX can't
             // run; kept only for A/B). Spawn on its own thread.
@@ -684,17 +698,6 @@ bool ApfpvStation::runConnectChain() {
         while (!_wpa->ready()) {
             if (steady_clock::now() - t0 > seconds(5)) { set(State::FailAuth); return false; }
             std::this_thread::sleep_for(milliseconds(20));
-        }
-        // NOW the link is secure. Apply user-selected bandwidth on the AP's channel.
-        // The assoc-response IE parsing (in the dispatch lambda) may have updated
-        // _params.bandwidth from the AP's VHT/HT Operation IEs.
-        if (_params.bandwidth >= 40) {
-            ChannelWidth_t w = _params.bandwidth >= 80 ? CHANNEL_WIDTH_80 : CHANNEL_WIDTH_40;
-            rm.set_channel_bwmode((uint8_t)_params.channel, 0, CHANNEL_WIDTH_20); // first: 20 MHz baseline
-            uint8_t off40 = rm.prime_offset_40mhz((uint8_t)_params.channel);
-            rm.set_channel_bwmode((uint8_t)_params.channel, off40, w);
-            SCANLOG("post-handshake retune: ch=%d off=%d width=%dMHz",
-                (int)_params.channel, (int)off40, _params.bandwidth);
         }
     }
 
