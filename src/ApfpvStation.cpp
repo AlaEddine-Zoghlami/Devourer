@@ -415,7 +415,13 @@ bool ApfpvStation::runConnectChain() {
         return dev.sendStationFrameSync(const_cast<uint8_t*>(f.data()), f.size());
     };
     StationMode sta(dev, rm, sendFrame);
-    sta.setConnectWidth(_params.bandwidth >= 40 ? CHANNEL_WIDTH_40 : CHANNEL_WIDTH_20);
+    // Use user-selected bandwidth: 40 or 80 MHz. If the selected bandwidth fails
+    // to connect, set DEVOURER_FORCE_20MHZ=1 to force 20 MHz (proven stable).
+    ChannelWidth_t userBw = _params.bandwidth >= 80 ? CHANNEL_WIDTH_80
+                          : _params.bandwidth >= 40 ? CHANNEL_WIDTH_40
+                          : CHANNEL_WIDTH_20;
+    if (std::getenv("DEVOURER_FORCE_20MHZ")) userBw = CHANNEL_WIDTH_20;
+    sta.setConnectWidth(userBw);
     MacAddr self{}, bssid{};
     // NOTE: our MAC is read from REG_MACID AFTER the device is brought up (below).
     // Reading it before Init returned EFUSE-unloaded garbage (e.g. ea:ea:ea:...).
@@ -464,9 +470,43 @@ bool ApfpvStation::runConnectChain() {
             uint16_t fc = (uint16_t)(f[0] | (f[1] << 8));
             if (((fc>>2)&3)==0 && n >= 30) {
                 uint8_t sub = (fc>>4)&0xF;
-                if (sub==0xB) fprintf(stderr, "[auth-resp]  status=%u\n", (unsigned)(f[28]|(f[29]<<8)));
-                if (sub==0x1) fprintf(stderr, "[assoc-resp] status=%u aid=0x%04x\n",
-                                      (unsigned)(f[26]|(f[27]<<8)), (unsigned)(f[28]|(f[29]<<8)));
+                if (sub==0x1 && n >= 24 + 6) {  // assoc response: parse HT/VHT Op IEs for BW
+                    // rtw_ies_get_chbw: extract bandwidth from AP's HT/VHT Operation IEs.
+                    // Without this, we never know what bandwidth the AP actually assigned us
+                    // and stay at 20 MHz even when the AP supports 40/80 MHz.
+                    uint8_t assocBw = 0, assocOff = 0; // 0=20, 1=40, 2=80 MHz
+                    const uint8_t* ie = f + 24 + 6;  // skip mgmt hdr + fixed assoc resp (6B)
+                    size_t ieLen = n - 24 - 6;
+                    for (size_t pos = 0; pos + 2 <= ieLen; ) {
+                        uint8_t id = ie[pos], len = ie[pos+1];
+                        if (pos + 2 + len > ieLen) break;
+                        if (id == 0x3D && len >= 22) {  // HT Capabilities IE
+                            if (ie[pos+2+1] & 0x04) assocBw = 1;  // Supported Chan Width Set
+                        } else if (id == 0x3E && len >= 3) {  // HT Operation IE
+                            if (assocBw == 1) {
+                                uint8_t staChWidth = ie[pos+2+2] & 0x01;  // STA Chan Width
+                                if (!staChWidth) assocBw = 0;  // AP says 20 MHz only
+                                uint8_t secOff = (ie[pos+2+1] & 0x03);  // Secondary Chan Offset
+                                if (secOff == 1) assocOff = 2;  // SCA -> UPPER
+                                else if (secOff == 3) assocOff = 1;  // SCB -> LOWER
+                            }
+                        } else if (id == 0xC0 && len >= 3) {  // VHT Operation IE
+                            uint8_t chWidth = ie[pos+2];  // 0=20/40, 1=80, 2=160
+                            if (chWidth >= 1 && assocBw >= 1) assocBw = 2;  // 80 MHz
+                        }
+                        pos += 2 + len;
+                    }
+                    if (assocBw > 0) {
+                        // AP supports this bandwidth. Use MIN(AP_cap, user_selected).
+                        // User pref is already in _params.bandwidth; cap it to AP max.
+                        int userBw = _params.bandwidth;
+                        if (userBw > 40 && assocBw < 2) _params.bandwidth = 40;
+                        if (userBw > 20 && assocBw < 1) _params.bandwidth = 20;
+                        SCANLOG("assoc-response: AP bw=%dMHz, using %dMHz (user=%d)",
+                            assocBw==2?80:assocBw==1?40:20,
+                            (int)_params.bandwidth, userBw);
+                    }
+                }
             }
             sp->onScanFrame(f, n);                  // beacons -> _scanResult
             std::string ss; ApInfo bi;
@@ -644,6 +684,17 @@ bool ApfpvStation::runConnectChain() {
         while (!_wpa->ready()) {
             if (steady_clock::now() - t0 > seconds(5)) { set(State::FailAuth); return false; }
             std::this_thread::sleep_for(milliseconds(20));
+        }
+        // NOW the link is secure. Apply user-selected bandwidth on the AP's channel.
+        // The assoc-response IE parsing (in the dispatch lambda) may have updated
+        // _params.bandwidth from the AP's VHT/HT Operation IEs.
+        if (_params.bandwidth >= 40) {
+            ChannelWidth_t w = _params.bandwidth >= 80 ? CHANNEL_WIDTH_80 : CHANNEL_WIDTH_40;
+            rm.set_channel_bwmode((uint8_t)_params.channel, 0, CHANNEL_WIDTH_20); // first: 20 MHz baseline
+            uint8_t off40 = rm.prime_offset_40mhz((uint8_t)_params.channel);
+            rm.set_channel_bwmode((uint8_t)_params.channel, off40, w);
+            SCANLOG("post-handshake retune: ch=%d off=%d width=%dMHz",
+                (int)_params.channel, (int)off40, _params.bandwidth);
         }
     }
 
