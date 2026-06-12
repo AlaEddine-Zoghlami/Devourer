@@ -712,7 +712,10 @@ bool ApfpvStation::runConnectChain() {
         });
     }
 
-    // mark link alive and go streaming
+    // mark link alive and go streaming.
+    // NOTE: A-MPDU RX Block-Ack is NOT yet implemented. Without it single-frame
+    // TXOPs cap at ~25Mbps regardless of MCS. 65+ Mbps requires ADDBA handshake
+    // + HW Block-Ack per-TID (H2C_BA_CTRL). USB agg now matches kernel values.
     _deauth.store(false);
     _lastRxMs.store(nowMs());
     set(State::Streaming);

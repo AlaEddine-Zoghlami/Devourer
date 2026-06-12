@@ -139,8 +139,12 @@ void RxDeframe::onPacket(const Packet& pkt) {
                 // Health summary every 120 unique pkts: received / dup-dropped / decrypt-failed / lost.
                 if ((_dbgRx % 120) == 0)
                     __android_log_print(ANDROID_LOG_INFO, "rxd-health",
-                        "rx=%d dropDup=%d decFail=%d lost=%d (pt=%u seq=%u)",
-                        _dbgRx, _dbgDrop, _dbgDecFail, _dbgLoss, pt, sq);
+                        "rx=%d dropDup=%d decFail=%d lost=%d (pt=%u seq=%u) rxrate=%u",
+                        _dbgRx, _dbgDrop, _dbgDecFail, _dbgLoss, pt, sq,
+                        (unsigned)pkt.RxAtrib.data_rate);
+                        // rxrate: 0-3=CCK 1/2/5.5/11, 4-11=OFDM 6..54, 12-27=HT MCS0-15,
+                        // 28+=VHT. Low (<12) => rate-control collapsed (ACK problem);
+                        // high MCS but sparse rx => A-MPDU/Block-Ack aggregation missing.
                 _seqHist[pt][_seqPos[pt]] = sq; _seqValid[pt][_seqPos[pt]] = true;
                 _seqPos[pt] = (uint8_t)((_seqPos[pt] + 1) & 127);
             }
