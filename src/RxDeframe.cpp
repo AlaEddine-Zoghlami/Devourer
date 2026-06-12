@@ -34,6 +34,10 @@ int RxDeframe::toDbm(uint8_t r) {
 }
 
 void RxDeframe::onPacket(const Packet& pkt) {
+    // Layer diagnostic: count frames entering RxDeframe + forwarded to RTP
+    static uint64_t inFrames=0, fwdFrames=0, decryptOk=0;
+    static auto layerClock = std::chrono::steady_clock::now();
+    inFrames++;
     if (_station) _station->notifyRxAlive();   // any RX = link alive (supervisor)
     if (_lq) _lq->update(toDbm(pkt.RxAtrib.rssi[0]), toDbm(pkt.RxAtrib.rssi[1]));
 
@@ -52,13 +56,26 @@ void RxDeframe::onPacket(const Packet& pkt) {
             }
             return;
         }
-        // 802.11 Action frame (subtype 0xD): could be ADDBA Request from the AP.
-        // The AP MUST receive an ADDBA Response to start A-MPDU aggregation so we can
-        // receive 30-64 frames per TXOP (needed for 65+ Mbps). Accept TID 0 (best-effort).
+        // 802.11 Action frame (subtype 0xD): BlockAck frames
         if (sub == 0xD && _station && len >= 24 + 3) {
             const uint8_t* body = f + 24; // 3-addr mgmt header
-            if (body[0] == 0x03 && body[1] == 0x00) { // BlockAck category, ADDBA Request
-                _station->handleAddbaRequest(f, len);
+            if (body[0] == 0x03) { // BlockAck category
+                if (body[1] == 0x00) { // ADDBA Request from AP -> send Response
+                    _station->handleAddbaRequest(f, len);
+                } else if (body[1] == 0x01) { // ADDBA Response from AP -> BA session established!
+                    // AP accepted our ADDBA Request. Enable reorder for this TID.
+                    u16 param = body[5] | (body[6] << 8);  // BA Parameter Set
+                    u8  tid   = (param >> 2) & 0x0f;
+                    u16 status = body[3] | (body[4] << 8);
+                    if (status == 0 && tid < 16) {
+                        _reorder[tid].enable = true;
+                        _reorder[tid].wsize_b = 64;
+                        _reorder[tid].indicate_seq = 0xffff;  // accept any start seq
+                        _reorder[tid].pending.clear();
+                        __android_log_print(4, "apfpv-scan",
+                            "ADDBA Response ACCEPTED tid=%u — A-MPDU enabled!", tid);
+                    }
+                }
             }
         }
         return;
@@ -89,6 +106,7 @@ void RxDeframe::onPacket(const Packet& pkt) {
             _dbgDecFail++;
             return;
         }
+        decryptOk++;
         llc = plainBuf.data(); llcLen = plainBuf.size();
     } else { llc = body; llcLen = bodyLen; }
     auto t1 = std::chrono::steady_clock::now();   // after CCMP decrypt (or skip)
@@ -103,9 +121,8 @@ void RxDeframe::onPacket(const Packet& pkt) {
         if (_wpa) _wpa->onEapolKey(llc + 8, llcLen - 8);
         return;
     }
-    // A-MPDU reorder disabled — the AP sends single frames (no Block-Ack working yet).
-    // When HW Block-Ack works, re-enable by removing this guard. The reorder buffer
-    // implementation (processReorder) is ready and tested.
+    // A-MPDU reorder disabled — AP sends single frames (Block-Ack HW not working).
+    // The reorder buffer (processReorder) is ready; enable when HW BA works.
     #if 0
     if ((fc & 0x0088) == 0x0088 && ethertype == 0x0800 && llcLen >= 28) {
         const uint8_t* ip = llc + 8; size_t ipl = llcLen - 8;
@@ -203,7 +220,19 @@ void RxDeframe::onPacket(const Packet& pkt) {
     if (ulen < 8 || (size_t)ulen > ipLen - ihl) return;
     const uint8_t* rtp = udp + 8; size_t rtpLen = ulen - 8;
     auto t2 = std::chrono::steady_clock::now();   // after IP decode, before RTP forward
-    if (rtpLen && _onRtp) _onRtp(rtp, rtpLen);   // (RTP de-dup happens earlier, ahead of _onIp)
+    if (rtpLen && _onRtp) { _onRtp(rtp, rtpLen); fwdFrames++; }
+    // Layer health every 1 second
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - layerClock).count();
+    if (elapsed >= 1000) {
+      float secs = (float)elapsed / 1000.0f;
+      __android_log_print(4, "rx-layer",
+        "IN=%d/s FWD=%d/s (%.1f%%) decOK=%d/s",
+        (int)(inFrames/secs), (int)(fwdFrames/secs),
+        (float)fwdFrames*100.f/(float)(inFrames+1),
+        (int)(decryptOk/secs));
+      inFrames=fwdFrames=decryptOk=0; layerClock = now;
+    }
     auto t3 = std::chrono::steady_clock::now();   // after RTP forward (socket send)
 
     // --- bottleneck diag: timing breakdown every RX_DIAG_INTERVAL packets ---
