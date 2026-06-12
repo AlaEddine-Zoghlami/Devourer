@@ -279,8 +279,8 @@ bool RxDeframe::processReorder(uint8_t tid, uint16_t seq, const uint8_t* llc, si
                     uint16_t dport = (u[2] << 8) | u[3];
                     if (dport == 5600) {
                         const uint8_t* rtp = u + 8;
-                        size_t rtpLen = (u[4] << 8) | u[5];
-                        if (rtpLen >= 8 && (size_t)(rtpLen) <= ipl - ihl)
+                        size_t rtpLen = ((u[4] << 8) | u[5]) - 8;  // UDP len minus 8B header = RTP len
+                        if (rtpLen > 0 && rtpLen <= ipl - ihl - 8)
                             _onRtp(rtp, rtpLen);
                     }
                 }
