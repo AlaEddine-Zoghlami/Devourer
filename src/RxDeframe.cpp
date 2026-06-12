@@ -126,8 +126,8 @@ void RxDeframe::onPacket(const Packet& pkt) {
             if (!s.active) { s.active = true; s.startSeq = seq80211; s.bitmap = 0; s.count = 0; }
             uint16_t off = (seq80211 - s.startSeq) & 0xFFF;
             if (off < 64) { s.bitmap |= (1ULL << off); s.count++; }
-            // Send BA every 64 frames or when bitmap fills (>60 of 64 slots used)
-            if (s.count >= 64 || off >= 62) {
+            // Send BA every 128 frames (minimize TX disruption)
+            if (s.count >= 128 || off >= 64) {
                 sendSoftwareBA(tid);
                 s.active = false;
             }

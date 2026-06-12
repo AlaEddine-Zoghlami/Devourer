@@ -10,6 +10,7 @@
 #include <mutex>
 #include <vector>
 #include <set>
+#include <deque>
 #include "ScanProbe.h"
 namespace apfpv {
 using Mac = std::array<uint8_t,6>;
@@ -149,6 +150,14 @@ private:
     std::atomic<bool> _deauth{false};
     std::atomic<bool> _run{false};   // supervisor running
     std::thread _supervisor;
+    // Dedicated Block-Ack TX queue (kernel-style: separate from RX dispatch).
+    // BA frames enqueued from dispatch thread, sent from this worker with brief RX pause.
+    std::deque<std::vector<uint8_t>> _baQueue;
+    std::mutex _baMtx;
+    std::condition_variable _baCv;
+    std::thread _baThread;
+    std::atomic<bool> _baRun{false};
+    void baTxLoop();  // BA TX worker thread
     // RX runs on its OWN thread (RtlJaguarDevice::Init is a blocking read loop).
     // A single dispatch routes by phase: 0 = discovery/arm (StationMode), 1 =
     // streaming (RxDeframe). _rxReady flips true once the loop is live.
