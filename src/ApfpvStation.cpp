@@ -692,10 +692,11 @@ bool ApfpvStation::runConnectChain() {
         _baQueue.emplace_back(ba, ba + len);
         _baCv.notify_one();
     });
-    // Start dedicated BA TX worker thread
-    if (!_baRun.exchange(true)) {
-        _baThread = std::thread(&ApfpvStation::baTxLoop, this);
-    }
+    // BA TX thread disabled — HW auto-generates BA at SIFS via FORCEACK.
+    // SW-BA implementation is ready; re-enable when needed.
+    // if (!_baRun.exchange(true)) {
+    //     _baThread = std::thread(&ApfpvStation::baTxLoop, this);
+    // }
     if (_ipSink) _rx->setIpSink(_ipSink);   // general-IP downlink -> VpnService TUN (SSH etc.)
     // Switch the ALREADY-RUNNING RX thread to the streaming path — do NOT re-Init
     // (that blocks). EAPOL (handshake), DHCP replies, and RTP now route through

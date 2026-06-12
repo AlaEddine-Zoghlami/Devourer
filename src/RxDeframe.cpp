@@ -116,8 +116,9 @@ void RxDeframe::onPacket(const Packet& pkt) {
     } else { llc = body; llcLen = bodyLen; }
     auto t1 = std::chrono::steady_clock::now();   // after CCMP decrypt (or skip)
 
-    // Software Block-Ack tracking (mac80211 does this in software for A-MPDU).
-    // Track received 802.11 sequence numbers per TID; send BA every ~16 frames.
+    // SW-BA disabled — HW auto-generates BA at SIFS via FORCEACK.
+    // Kernel drivers (rtw88, aircrack-ng) confirm: no software BA needed.
+    #if 0
     if ((fc & 0x0080) && _baSend) { // QoS-data
         uint16_t seq80211 = (uint16_t)((f[23] << 4) | (f[22] >> 4));
         uint8_t  tid = (hdrLen >= 26) ? (f[24] & 0x0f) : 0;
@@ -133,6 +134,7 @@ void RxDeframe::onPacket(const Packet& pkt) {
             }
         }
     }
+    #endif // SW-BA disabled
 
     if (llcLen < 8) return;
     static const uint8_t snap[6] = {0xaa,0xaa,0x03,0x00,0x00,0x00};
