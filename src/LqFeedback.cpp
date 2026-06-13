@@ -98,6 +98,10 @@ static void loopFrameDriven() {
 }
 
 bool LqFeedback::start(const char* airIp, uint16_t port) {
+    // A prior start() may have left a running thread (e.g. on replug/reconnect
+    // the connect chain re-runs without stop()). Move-assigning g.th below while
+    // it is still joinable calls std::terminate(). Tear the old one down first.
+    if (g.th.joinable()) stop();
     g.sock = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (g.sock < 0) return false;
     std::memset(&g.dst, 0, sizeof(g.dst));

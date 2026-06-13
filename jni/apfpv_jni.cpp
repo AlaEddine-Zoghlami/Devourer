@@ -127,6 +127,18 @@ static bool ensureStation(StaCtx* ctx) {
         ctx->driver = std::make_unique<WiFiDriver>(nullptr /*Logger_t*/);
         ctx->rtl = ctx->driver->CreateRtlDevice(ctx->handle);
         if (!ctx->rtl) { LOGE("CreateRtlDevice returned null"); return false; }
+        // Hand the raw usbfs fd to the adapter for direct USBDEVFS_BULK OUT.
+        // DEFAULT ON — bypasses libusb's OUT-behind-IN queue so the kernel USB
+        // stack interleaves our OUT (ADDBA Response etc.) with the async IN URBs
+        // at the hardware level. USBDEVFS_BULK is synchronous in the kernel and
+        // does NOT touch libusb's async reap queue, so they coexist on one fd.
+        // DEVOURER_NO_RAW_TX disables for A/B comparison.
+        if (!std::getenv("DEVOURER_NO_RAW_TX") && ctx->wrappedFd >= 0) {
+            uint8_t outEp = 0x03;
+            if (const char* e = std::getenv("DEVOURER_TX_EP")) outEp = (uint8_t)strtoul(e, nullptr, 0);
+            ctx->rtl->adapter().setTxFd(ctx->wrappedFd, outEp);
+            LOGI("raw-fd TX enabled: fd=%d ep=0x%02x", ctx->wrappedFd, outEp);
+        }
         ctx->station = std::make_unique<ApfpvStation>(
             &ctx->rtl->adapter(), &ctx->rtl->radioManager(), onRtp, onState);
         ctx->station->setDevice(ctx->rtl.get());

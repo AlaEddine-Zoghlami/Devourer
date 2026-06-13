@@ -702,11 +702,6 @@ bool ApfpvStation::runConnectChain() {
         }
     }
 
-    // Kernel writes AMPDU params UNCONDITIONALLY after association (rtw_wlan_util.c
-    // :2095-2098), NOT gated on ADDBA. The AP sends ADDBA Request later (during
-    // streaming) — handleAddbaRequest answers it immediately. But the HW must already
-    // know the AMPDU spacing/length BEFORE the BA session starts, else it can't
-    // generate the SIFS Block-Ack for aggregates. Write these now.
     if (!std::getenv("DEVOURER_SKIP_ADDBA")) {
         dev.rtw_write8(0x045C, 7);                    // REG_AMPDU_MIN_SPACE = 16µs
         uint32_t al = dev.rtw_read32(0x0456);
@@ -842,59 +837,48 @@ bool ApfpvStation::runConnectChain() {
     _deauth.store(false);
     _lastRxMs.store(nowMs());
     set(State::Streaming);
+    // ADDBA Requests are answered directly in handleAddbaRequest (raw-fd TX),
+    // which also covers requests arriving during streaming — no connect-time
+    // batch/pause needed.
     return true;
 }
 
 void ApfpvStation::handleAddbaRequest(const uint8_t* frame, size_t len) {
-    if (len < 24 + 9) return;  // mgmt hdr + ADDBA Request body (cat+act+tok+param+timeout+start_seq)
-    const uint8_t* body = frame + 24;  // skip 3-addr mgmt header
-    u8  dialog = body[2];
-    u16 param  = body[3] | (body[4] << 8);
-    u8  tid    = (param >> 2) & 0x0f;  // TID from BA Parameter Set
-    // Debounce: only respond ONCE per TID per connection epoch (via the member
-    // _pendingAddbaTids, reset in runConnectChain). The AP retries when our response
-    // is lost; answering every retry creates a TX storm that starves RX.
+    if (len < 24 + 9) return;
+    const uint8_t* body = frame + 24;
+    if (!(body[0] == 0x03 && body[1] == 0x00)) return;
+    u8 tid = ((body[3] | (body[4] << 8)) >> 2) & 0x0f;
     if (_pendingAddbaTids & (1 << tid)) return;
-    // Build ADDBA Response: accept TID 0, immediate BA, buffer size 64
-    auto& dev = *reinterpret_cast<RtlUsbAdapter*>(_dev);
-    MacAddr bssid; for (int i=0;i<6;i++) bssid.b[i] = _params.bssid[i];
-    std::vector<uint8_t> rsp;
-    rsp.push_back(0xD0); rsp.push_back(0x00);   // FC: mgmt, action
-    rsp.push_back(0x00); rsp.push_back(0x00);   // duration
-    rsp.insert(rsp.end(), bssid.b.data(), bssid.b.data() + 6); // A1=AP BSSID
-    // A2=self MAC: read from EFUSE
-    for (int i=0;i<6;i++) rsp.push_back(dev.rtw_read8(0x0610 + i));
-    rsp.insert(rsp.end(), bssid.b.data(), bssid.b.data() + 6); // A3=AP BSSID
-    rsp.push_back(0x00); rsp.push_back(0x00);   // seq ctl
-    // ADDBA Response body
-    rsp.push_back(0x03); // Category: Block Ack
-    rsp.push_back(0x01); // Action: ADDBA Response
-    rsp.push_back(dialog); // Dialog token (match request)
-    rsp.push_back(0x00); rsp.push_back(0x00);   // Status: SUCCESS
-    // BA Parameter Set: TID=0, buf=64, immediate BA (mirror request)
-    rsp.push_back((u8)(param & 0xff));
-    rsp.push_back((u8)(param >> 8));
-    rsp.push_back(0x00); rsp.push_back(0x00);   // BA Timeout: 0 = default
-    rsp.push_back(body[7]); rsp.push_back(body[8]); // BA Starting Seq (mirror request)
-    // mac80211 ieee80211_send_addba_resp() -> ieee80211_tx_skb(): software TX.
-    // Send NOW (debounced once per TID via seenTids above, so at most 8 brief pauses
-    // over the whole session — NOT per-frame). The AP sends ADDBA during streaming,
-    // so the batch-in-connect path never catches it; respond here directly.
-    std::vector<uint8_t> txf(40 + rsp.size(), 0);
-    std::memcpy(txf.data() + 40, rsp.data(), rsp.size());
-    apfpv::FillStationTxDesc(txf.data(), (uint16_t)rsp.size(), 40,
-                             1, apfpv::StationFrameKind::Mgmt, 0x0c, 0x04);
-    dev.pauseAsyncRx();
-    dev.sendStationFrameSync(txf.data(), txf.size());
-    dev.resumeAsyncRx();
-    // Dump our outgoing ADDBA Response body bytes (24 = after mgmt hdr) to compare
-    // with what the kernel sends — buffer size / policy / status must satisfy the AP.
-    { const uint8_t* rb = rsp.data() + 24;
-      u16 rp = rb[5] | (rb[6] << 8);
-      SCANLOG("ADDBA-RSP-OUT dialog=%u status=%u param=0x%04x policy=%u tid=%u bufsz=%u",
-        rb[2], rb[3]|(rb[4]<<8), rp, (rp>>1)&1, (rp>>2)&0x0f, (rp>>6)&0x3ff); }
-    SCANLOG("ADDBA Response SENT tid=%u dialog=%u (immediate, debounced)", tid, dialog);
     _pendingAddbaTids |= (1 << tid);
+
+    auto& dev = *reinterpret_cast<RtlUsbAdapter*>(_dev);
+    MacAddr ba; for (int i=0;i<6;i++) ba.b[i] = _params.bssid[i];
+    std::vector<uint8_t> r;
+    r.push_back(0xD0); r.push_back(0x00); r.push_back(0x00); r.push_back(0x00);
+    r.insert(r.end(), ba.b.data(), ba.b.data()+6);
+    for (int i=0;i<6;i++) r.push_back(dev.rtw_read8(0x0610+i));
+    r.insert(r.end(), ba.b.data(), ba.b.data()+6);
+    static uint16_t s=0; s++; r.push_back(s&0xff); r.push_back((s>>4)&0xff);
+    u8 dialog = body[2];
+    r.push_back(0x03); r.push_back(0x01); r.push_back(dialog);
+    r.push_back(0x00); r.push_back(0x00);
+    u16 p=body[3]|(body[4]<<8); r.push_back(p&0xff); r.push_back(p>>8);
+    r.push_back(body[5]); r.push_back(body[6]);
+    r.push_back(body[7]); r.push_back(body[8]);
+
+    // Send the ADDBA Response DIRECTLY via send_packet. With the raw-fd
+    // USBDEVFS_BULK TX path this is a synchronous kernel ioctl that the USB
+    // stack interleaves with the in-flight IN URBs — it does NOT block the
+    // libusb event loop or touch its async reap queue, so it is safe to call
+    // from the RX dispatch here. This answers the AP within ~ms (no pause hack)
+    // and also handles ADDBA Requests that arrive DURING streaming, not just
+    // the connect-time burst.
+    std::vector<uint8_t> txf(40 + r.size(), 0);
+    memcpy(txf.data()+40, r.data(), r.size());
+    FillStationTxDesc(txf.data(), (uint16_t)r.size(), 40,
+                      1, StationFrameKind::Mgmt, 0x0c, 0x04);
+    dev.send_packet(txf.data(), txf.size());
+    SCANLOG("ADDBA Response tid=%u (direct, raw-fd TX)", tid);
 }
 
 bool ApfpvStation::connect(const Params& p) {
