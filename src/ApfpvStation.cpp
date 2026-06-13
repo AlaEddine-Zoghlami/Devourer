@@ -703,10 +703,13 @@ bool ApfpvStation::runConnectChain() {
     }
 
     if (!std::getenv("DEVOURER_SKIP_ADDBA")) {
+        // Kernel ampdu_rx_start_init(): MIN_SPACE, MAX_LENGTH BIT31 (RX_AMPDU enable),
+        // and 0x1C |= BIT5|BIT6 (prevent MAC reset by bus, per kernel usb_halinit).
         dev.rtw_write8(0x045C, 7);                    // REG_AMPDU_MIN_SPACE = 16µs
-        uint32_t al = dev.rtw_read32(0x0456);
-        dev.rtw_write32(0x0456, al | 0x80000000);     // AMPDU_MAX_LENGTH BIT31 = enable RX
-        SCANLOG("AMPDU HW: MIN_SPACE=7 MAX_LEN=0x%08x", al | 0x80000000);
+        dev.rtw_write8(0x1C, dev.rtw_read8(0x1C) | 0x60); // BIT5|BIT6: prevent MAC reset
+        uint32_t al = dev.rtw_read32(0x0458);          // REG_AMPDU_MAX_LENGTH_8812
+        dev.rtw_write32(0x0458, al | 0x80000000);      // BIT31 = RX_AMPDU enable
+        SCANLOG("AMPDU HW: MAX_LEN=0x%08x (was 0x%08x)", al | 0x80000000, al);
     }
 
     // ENCRYPT round-trip self-test: encrypt a dummy IPv4/UDP datagram, then decrypt it through
@@ -840,6 +843,20 @@ bool ApfpvStation::runConnectChain() {
     // ADDBA Requests are answered directly in handleAddbaRequest (raw-fd TX),
     // which also covers requests arriving during streaming — no connect-time
     // batch/pause needed.
+
+    // NOTE: tried clearing RCR FORCEACK (BIT26) here post-handshake to mirror the
+    // Windows native driver (usbmon RCR 0x3f6800f4, FORCEACK=0). It did NOT durably
+    // help — DELBA churn returned (~17/20s) and throughput stayed at the single-
+    // frame ceiling. Windows runs FORCEACK=0 only because FWOffload has the firmware
+    // own ACK/BA; without that mode FORCEACK=0 just loses the normal ACK. Reverted.
+    // Opt back in for experiments via DEVOURER_STREAM_NOACK.
+    if (std::getenv("DEVOURER_STREAM_NOACK")) {
+        auto& dev = *reinterpret_cast<RtlUsbAdapter*>(_dev);
+        uint32_t rcr = dev.rtw_read32(0x0608);
+        rcr &= ~0x04000000u;   // clear FORCEACK (BIT26)
+        dev.rtw_write32(0x0608, rcr);
+        SCANLOG("STREAM_NOACK: RCR FORCEACK cleared -> 0x%08x", rcr);
+    }
     return true;
 }
 
@@ -885,8 +902,13 @@ void ApfpvStation::handleAddbaRequest(const uint8_t* frame, size_t len) {
     memcpy(txf.data()+40, r.data(), r.size());
     FillStationTxDesc(txf.data(), (uint16_t)r.size(), 40,
                       1, StationFrameKind::Mgmt, 0x0c, 0x04);
+    // send_packet (raw-fd USBDEVFS_BULK): non-blocking, ~µs completion via
+    // kernel USB stack. The chip's MAC hardware updates TXPKT_EMPTY when the
+    // frame drains, regardless of whether WE poll it — the firmware reads the
+    // same hardware register. sendStationFrameSync blocks too long (80ms for
+    // 8 TIDs), starving RX and causing decryption failures.
     dev.send_packet(txf.data(), txf.size());
-    SCANLOG("ADDBA Response tid=%u (direct, raw-fd TX)", tid);
+    SCANLOG("ADDBA Response tid=%u (raw-fd send_packet)", tid);
 }
 
 bool ApfpvStation::connect(const Params& p) {
