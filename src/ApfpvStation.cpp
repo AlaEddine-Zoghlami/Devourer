@@ -848,8 +848,12 @@ void ApfpvStation::handleAddbaRequest(const uint8_t* frame, size_t len) {
     const uint8_t* body = frame + 24;
     if (!(body[0] == 0x03 && body[1] == 0x00)) return;
     u8 tid = ((body[3] | (body[4] << 8)) >> 2) & 0x0f;
-    if (_pendingAddbaTids & (1 << tid)) return;
-    _pendingAddbaTids |= (1 << tid);
+    // Respond to EVERY ADDBA Request. A per-TID debounce here was actively
+    // harmful: after the connect-time burst set all 8 TID bits, the AP's later
+    // re-requests (session timeout / re-establish during streaming) were
+    // silently dropped -> the AP got no Response -> DELBA -> re-request loop.
+    // The AP only re-requests when it needs to; answering each one keeps the
+    // BA session alive. (raw-fd TX makes per-request sends cheap.)
 
     auto& dev = *reinterpret_cast<RtlUsbAdapter*>(_dev);
     MacAddr ba; for (int i=0;i<6;i++) ba.b[i] = _params.bssid[i];
@@ -859,12 +863,16 @@ void ApfpvStation::handleAddbaRequest(const uint8_t* frame, size_t len) {
     for (int i=0;i<6;i++) r.push_back(dev.rtw_read8(0x0610+i));
     r.insert(r.end(), ba.b.data(), ba.b.data()+6);
     static uint16_t s=0; s++; r.push_back(s&0xff); r.push_back((s>>4)&0xff);
+    // ADDBA Response body (802.11 §9.6.5.3): Category + Action + DialogToken +
+    // StatusCode(2) + BAParameterSet(2) + BATimeout(2) = 9 bytes EXACTLY. Do NOT
+    // append the request's Starting Sequence Control — that is Request-only; the
+    // extra 2 bytes made the frame malformed and some APs silently reject it (so
+    // they never aggregate). Echo the AP's BA param set + timeout verbatim.
     u8 dialog = body[2];
     r.push_back(0x03); r.push_back(0x01); r.push_back(dialog);
-    r.push_back(0x00); r.push_back(0x00);
-    u16 p=body[3]|(body[4]<<8); r.push_back(p&0xff); r.push_back(p>>8);
-    r.push_back(body[5]); r.push_back(body[6]);
-    r.push_back(body[7]); r.push_back(body[8]);
+    r.push_back(0x00); r.push_back(0x00);                       // StatusCode = 0 (success)
+    r.push_back(body[3]); r.push_back(body[4]);                 // BA Parameter Set (echo)
+    r.push_back(body[5]); r.push_back(body[6]);                 // BA Timeout (echo)
 
     // Send the ADDBA Response DIRECTLY via send_packet. With the raw-fd
     // USBDEVFS_BULK TX path this is a synchronous kernel ioctl that the USB
