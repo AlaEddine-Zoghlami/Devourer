@@ -19,6 +19,10 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <cstring>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/resource.h>
+#include <unistd.h>
 
 #include "ApfpvStation.h"
 #include "WiFiDriver.h"
@@ -152,6 +156,17 @@ static bool ensureStation(StaCtx* ctx) {
         if (!ctx->evtRun.load()) {
             ctx->evtRun.store(true);
             ctx->evtThread = std::thread([ctx]() {
+                // Lever B (kernel-match): the USB reaper must be scheduled the instant a URB
+                // completes, to recycle buffers back into the submit queue with minimal latency
+                // (our userspace stand-in for the kernel's in-IRQ resubmit). Try SCHED_FIFO RT
+                // priority; if the app lacks CAP_SYS_NICE (typical), fall back to the lowest nice
+                // so the scheduler still favours us over the decode/render threads.
+                {
+                    struct sched_param sp{}; sp.sched_priority = 80;
+                    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
+                        setpriority(PRIO_PROCESS, 0, -19);   // nice -19 fallback
+                    }
+                }
                 while (ctx->evtRun.load()) {
                     // Yield while a cal/TX has RX paused so we don't hold the event lock
                     // against its synchronous control reads (serialization fix).
@@ -159,7 +174,9 @@ static bool ensureStation(StaCtx* ctx) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
                         continue;
                     }
-                    struct timeval tv { 0, 100000 };
+                    // Short timeout: handle_events returns immediately when a URB completes
+                    // (poll-driven); the timeout only bounds idle latency for the rxQuiesce check.
+                    struct timeval tv { 0, 2000 };   // 2ms (was 100ms)
                     libusb_handle_events_timeout_completed(ctx->usb, &tv, nullptr);
                 }
             });
@@ -256,6 +273,7 @@ Java_com_openipc_wfbngrtl8812_ApfpvStaLink_nativeStaConnect(
     const char* ssid = env->GetStringUTFChars(jssid, nullptr);
     const char* pass = env->GetStringUTFChars(jpass, nullptr);
     const char* bstr = jbssid ? env->GetStringUTFChars(jbssid, nullptr) : nullptr;
+    LOGI("nativeStaConnect: channel=%d bw=%d ssid=%s bssid=%s", (int)channel, (int)bandwidth, ssid ? ssid : "(null)", bstr ? bstr : "(null)");
     try {
         // Stop any prior scan/supervisor on this device before a fresh connect.
         ctx->station->disconnect();
@@ -268,7 +286,13 @@ Java_com_openipc_wfbngrtl8812_ApfpvStaLink_nativeStaConnect(
             if (sscanf(bstr, "%x:%x:%x:%x:%x:%x", &b[0],&b[1],&b[2],&b[3],&b[4],&b[5]) == 6) {
                 for (int i = 0; i < 6; ++i) p.bssid[i] = (uint8_t)b[i];
                 p.haveBssid = true; p.scan = false;
+                LOGI("BSSID parsed: %02x:%02x:%02x:%02x:%02x:%02x, haveBssid=1 scan=0",
+                     p.bssid[0],p.bssid[1],p.bssid[2],p.bssid[3],p.bssid[4],p.bssid[5]);
+            } else {
+                LOGI("BSSID parse FAILED for '%s'", bstr);
             }
+        } else {
+            LOGI("No BSSID provided — will scan");
         }
         // Static-IP mode: a non-empty "a.b.c.d" from JNI -> SKIP DHCP and bind it; empty/null -> DHCP.
         if (jStaticIp) {

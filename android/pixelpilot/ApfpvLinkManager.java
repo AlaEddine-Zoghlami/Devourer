@@ -34,8 +34,8 @@ public class ApfpvLinkManager {
     private final ActivityVideoBinding binding;
     private final ApfpvStaLink staLink;
 
-    private int     wifiChannel = 40;        // default to legal 5.2 GHz UNII-1
-    private int     bandWidth   = 20;        // 20 MHz = full 200 mW under PSD cap
+    private int     wifiChannel = 64;        // Taiga AP channel
+    private int     bandWidth   = 80;        // 80 MHz for full throughput
     private String  ssid        = "OpenIPC";
     private String  passphrase  = "12345678";
 
@@ -104,7 +104,8 @@ public class ApfpvLinkManager {
         // Runs the WHOLE gated native chain: ARM -> auth -> assoc -> WPA2 ->
         // DHCP -> RTP. State callbacks drive the UI; STREAMING => video on 5600.
         ApfpvStaLink.nativeStaConnect(staLinkHandle(), staLink, fd,
-                                      wifiChannel, bandWidth, ssid, passphrase);
+                                      wifiChannel, bandWidth, ssid, passphrase,
+                                      "50:e6:36:7d:54:f3", "");  // Taiga BSSID -> skip scan
         // Turn on dongle-RSSI -> VTX:12345 feedback (better than stock phone-APFPV)
         ApfpvStaLink.nativeStaSetLqFeedback(staLinkHandle(), true);
         return true;

@@ -18,6 +18,7 @@
 #include "FrameParser.h"
 #include "ScanProbe.h"
 #include "LqFeedback.h"
+#include "PhydmWatchdog.h"
 #include "RtlUsbAdapter.h"
 #include "RtlJaguarDevice.h"
 #include "SelectedChannel.h"
@@ -634,6 +635,28 @@ bool ApfpvStation::runConnectChain() {
         case StationMode::Result::Error:             set(State::FailNoAp);  return false;
         case StationMode::Result::GO_LinkHeld: break;
     }
+    // ⭐ POST-ASSOC BANDWIDTH UPGRADE: the pre-arm tune (above) dropped the radio to 20 MHz for
+    // a clean auth/assoc, and nothing re-tuned it afterward — so the radio stayed at 20 MHz and
+    // we could only RX the 20 MHz primary (rxd-health bw=0, VHT 2SS capped ~104 Mbps PHY). The
+    // AP also matches our 20 MHz. Re-tune to the negotiated width (80 MHz) now that assoc is up,
+    // so the HW receives the full 80 MHz A-MPDU (bw=2) — the kernel runs at 80 MHz here (867 Mbps).
+    // CRITICAL: set_channel_bwmode runs the IQK, which needs CLEAN control I/O — the 16 in-flight
+    // RX URBs (and the PHYDM watchdog's BB reads) contend with the IQK loopback over libusb and
+    // make it FAIL (A_done=0, retry=10), leaving the 80 MHz radio mis-calibrated so the AP falls
+    // back to 20 MHz. Pause RX around the retune exactly like arm() does for its IQK.
+    if (_params.bandwidth >= 80 && !std::getenv("DEVOURER_FORCE_20MHZ")) {
+        dev.pauseAsyncRx();
+        rm.set_channel_bwmode((uint8_t)_params.channel, 0, CHANNEL_WIDTH_80);
+        dev.resumeAsyncRx();
+        SCANLOG("post-assoc: radio -> 80 MHz on ch%d (RX paused for clean IQK)", (int)_params.channel);
+    } else if (_params.bandwidth >= 40 && !std::getenv("DEVOURER_FORCE_20MHZ")) {
+        uint8_t c = (uint8_t)_params.channel;
+        uint8_t off = (c > 14) ? (((c / 4) & 1) ? 1 : 2) : ((c <= 7) ? 1 : 2);
+        dev.pauseAsyncRx();
+        rm.set_channel_bwmode(c, off, CHANNEL_WIDTH_40);
+        dev.resumeAsyncRx();
+        SCANLOG("post-assoc: radio -> 40 MHz on ch%d (RX paused for clean IQK)", (int)_params.channel);
+    }
     set(State::Handshaking);
     // ONE supplicant (member), used for handshake + RX decrypt + encrypted TX.
     Mac selfMac{}, bss{};
@@ -702,14 +725,83 @@ bool ApfpvStation::runConnectChain() {
         }
     }
 
+    // ⭐ Lever C.2 (kernel-parity HW CCMP decrypt) — GATED OFF by default. When enabled, the chip
+    // decrypts RX in hardware so the single RX worker just de-aggregates + forwards plaintext
+    // (the kernel's lean tasklet), removing the per-packet SW AES-CCM from the hot path. The PTK
+    // (unicast video) goes in CAM entry 4 keyed to the AP BSSID/keyid0; the GTK (bcast) in entry 5.
+    // RxDeframe must then SKIP SW decrypt for HW-decrypted frames (pkt.bdecrypted) — that side is
+    // gated by the same env. UNTESTED end-to-end (frame layout post-HW-decrypt needs validation);
+    // ship A+B first, enable this only if the worker proves to be the throughput cap.
+    if (std::getenv("DEVOURER_HW_DECRYPT")) {   // OFF by default: HW decrypt works but didn't lift the 30Mbps cap
+        const auto& tk = _wpa->tk();
+        dev.setSecCamKey(4, _params.bssid.data(), 0, tk.data());          // PTK pairwise, keyid 0
+        if (_wpa->gtkKeyId() != 0xff) {
+            const auto& gtk = _wpa->gtk();
+            dev.setSecCamKey(5, _params.bssid.data(), _wpa->gtkKeyId(), gtk.data());  // GTK group
+        }
+        dev.enableHwSec();                                                // REG_SECCFG = 0x0c01
+        SCANLOG("HW-DECRYPT: PTK->CAM4 GTK->CAM5(kid=%u) SECCFG=0c01 (RX worker now forwards plaintext)",
+                (unsigned)_wpa->gtkKeyId());
+    }
+
     if (!std::getenv("DEVOURER_SKIP_ADDBA")) {
-        // Kernel ampdu_rx_start_init(): MIN_SPACE, MAX_LENGTH BIT31 (RX_AMPDU enable),
-        // and 0x1C |= BIT5|BIT6 (prevent MAC reset by bus, per kernel usb_halinit).
-        dev.rtw_write8(0x045C, 7);                    // REG_AMPDU_MIN_SPACE = 16µs
+        // REG_AMPDU_MIN_SPACE: the kernel does NOT write this (leaves chip default). We forced
+        // 7 = 16µs min MPDU spacing, which over-restricts the AP's downlink A-MPDU packing (at
+        // high MCS a 1.5KB frame is <16µs, so 16µs spacing pads/caps the aggregate → the ~30Mbps
+        // ceiling). Set 0 = no extra spacing (chip handles dense A-MPDU; matches kernel intent).
+        dev.rtw_write8(0x045C, 0);                     // was 7 (16µs) — let the chip pack tight
         dev.rtw_write8(0x1C, dev.rtw_read8(0x1C) | 0x60); // BIT5|BIT6: prevent MAC reset
-        uint32_t al = dev.rtw_read32(0x0458);          // REG_AMPDU_MAX_LENGTH_8812
-        dev.rtw_write32(0x0458, al | 0x80000000);      // BIT31 = RX_AMPDU enable
-        SCANLOG("AMPDU HW: MAX_LEN=0x%08x (was 0x%08x)", al | 0x80000000, al);
+
+        // ⭐ KERNEL-EXACT BA REGISTER SET (full usbmon init→connect diff vs the kernel @867Mbps
+        // A-MPDU). The streaming capture proved the BlockAck is HW-AUTOMATIC (no BACAM write, no
+        // BA H2C at runtime) — so it's armed purely by these init/response registers + the HW
+        // seeing the ADDBA. We were writing several of them WRONG; matching the kernel byte-for-
+        // byte is the only lever for the HW auto-BA. Each value is the kernel's final write.
+        if (!std::getenv("DEVOURER_SKIP_BAREGS")) {
+            // A-MPDU max length: we blasted 0xffffffff; kernel uses a SPECIFIC factor. The all-ones
+            // value mis-sizes the HW aggregate handling (BIT31 = RX_AMPDU enable is kept).
+            dev.rtw_write32(0x0458, 0xffff0180);   // REG_AMPDU_MAX_LENGTH (kernel operational)
+            dev.rtw_write32(0x0420, 0x001f71ff);   // aggregation ctrl (kernel operational)
+            // REG_RRSR (0x0440, Response Rate Set): the rates our HW sends ACK/CTS/BlockAck at.
+            // We used 0x00000fff (kernel INIT value = all rates) → the HW may answer high-MCS data
+            // with a too-aggressive BA the AP misses on the weaker uplink (our measured 4-7% retry
+            // → slow per-A-MPDU cadence → ~30Mbps). Kernel OPERATIONAL (trace line 19277, streaming)
+            // = 0x0440=0x5001 + 0x0442=0x20 (robust response rates). Gated by DEVOURER_NO_RRSR.
+            if (!std::getenv("DEVOURER_NO_RRSR")) {
+                dev.rtw_write16(0x0440, 0x5001);   // RRSR low (kernel operational)
+                dev.rtw_write8 (0x0442, 0x20);     // RRSR high byte (kernel operational)
+            }
+            // Response SIFS (Rx→Tx) — the compressed BlockAck must radiate at SIFS or the AP
+            // never sees it and backs its rate-control off to MCS0/20MHz. The FULL kernel SIFS
+            // block, taken from the *operational* (post-connect) writes in the usbmon trace —
+            // NOT the early init values. (Re-derived 2026-06-21 by last-write-wins on the trace.)
+            dev.rtw_write16(0x0514, 0x0e10);       // REG_SIFS_CTX  (kernel 0x0e10; we had 0x100a — WRONG bytes)
+            dev.rtw_write16(0x0516, 0x0e10);       // REG_SIFS_TRX  (kernel 0x0e10; we had 0x100a — WRONG bytes)
+            dev.rtw_write16(0x063A, 0x0e10);       // REG_SIFS (Trx) low=0x10 hi(063B)=0x0E
+            dev.rtw_write8 (0x063C, 0x08);         // SIFS_R2T_CCK  (kernel 0x08)
+            dev.rtw_write8 (0x063D, 0x08);         // SIFS_R2T_OFDM (kernel 0x08)
+            dev.rtw_write8 (0x063E, 0x0E);         // SIFS_T2T_CCK  (kernel 0x0E)
+            dev.rtw_write8 (0x063F, 0x0A);         // SIFS_T2T_OFDM (kernel 0x0A)
+            dev.rtw_write8 (0x0429, 0x0E);         // SPEC_SIFS OFDM (kernel operational 0x0E)
+            dev.rtw_write8 (0x051B, 0x09);         // REG_SLOT = 9µs (kernel writes; we didn't)
+            // TCR (0x0607): the kernel's *operational* value (trace line 19733, during streaming)
+            // is 0x07 — it KEEPS BIT2 set. Our prior "fix" cleared BIT2 to 0x03 based on the
+            // early-init write (line 5193) and got the direction backwards: BIT2 governs the VHT
+            // A-MPDU response, so clearing it broke the exact thing we needed. Restore 0x07.
+            uint8_t tcr3 = dev.rtw_read8(0x0607);
+            dev.rtw_write8 (0x0607, (uint8_t)(tcr3 | 0x07)); // kernel operational 0x07 (set BIT0|1|2)
+            // EDCA BE: kernel operational = 0x2ba45e00 (line 20081). Our prior 0x2ba40000 came
+            // from a transient init write (line 19287) and zeroed the TXOP-limit field, hurting
+            // aggregation. Restore the operational value.
+            dev.rtw_write32(0x0508, 0x2ba45e00);   // REG_EDCA_BE_PARAM (kernel operational)
+            SCANLOG("BA-regs kernel-OPERATIONAL: SIFS_CTX/TRX=0e10 063a=0e10 RESP_SIFS=08080E0A 0607|=07 0508=2ba45e00 SLOT=09");
+        }
+        // NOTE: a "KPROTO replay" experiment (set the 96 MAC registers the kernel writes that we
+        // don't — 0x0668 base, SECCFG, BFMER0/CSI_RPT VHT-sounding, SND_PTCL) was tested 2026-06-21
+        // and made things MUCH WORSE (retryBit 30%→71%, throughput 17→4Mbps). Blindly injecting the
+        // kernel's registers breaks coherence: our overall chip state differs, so the kernel's values
+        // are wrong for OUR state. Conclusion: the BA gap is a STATE/SEQUENCE divergence, not copyable
+        // individual registers. Reverted. Next: diff OUR driver's full usbmon vs the kernel's.
     }
 
     // ENCRYPT round-trip self-test: encrypt a dummy IPv4/UDP datagram, then decrypt it through
@@ -865,6 +957,44 @@ void ApfpvStation::handleAddbaRequest(const uint8_t* frame, size_t len) {
     const uint8_t* body = frame + 24;
     if (!(body[0] == 0x03 && body[1] == 0x00)) return;
     u8 tid = ((body[3] | (body[4] << 8)) >> 2) & 0x0f;
+    uint16_t startSsn = (uint16_t)((body[7] | (body[8] << 8)) >> 4);   // ADDBA-Req Starting Seq
+
+    // ⭐ BA-CAM ARM (experimental, opt-in via DEVOURER_BACAM): the AP requested an RX-BA
+    // session for this TID. The HW MAC emits the SIFS compressed BlockAck ONLY when its
+    // BA-CAM (REG_BACAMCMD 0x0654 / REG_BACAMCONTENT 0x0658) holds a valid per-TID/per-peer
+    // entry. On the kernel the FIRMWARE auto-arms it from the ADDBA seen on the station RX
+    // path; our libusb RX path never triggers that auto-arm, so BACAMCMD reads 0 and the AP
+    // retransmits every unacked A-MPDU (the ~50% PN-replay / decFail at >20Mbps). Program it
+    // ourselves, modeled on rtw89_fw_h2c_ba_cam's w0 layout:
+    //   valid:0 init_req:1 entry_idx:3-2 tid:7-4 macid:15-8 bmap_size:19-16 ssn:31-20
+    // RESULT (2026-06-21): the writes take (CMD BIT31 polls clear) but do NOT arm the SIFS
+    // BlockAck — decFail stayed ~89% at 30Mbps and the CONTENT readback ≠ what we wrote, so
+    // this rtw89-derived w0 layout is WRONG for the 8812's BA-CAM (the vendor driver never
+    // writes it, so there's no reference format). Gated OFF; the 8812 BA-CAM arming is
+    // firmware-internal (FWOffload), not reproducible by a register poke. Opt-in to keep
+    // experimenting on the format via DEVOURER_BACAM.
+    if (std::getenv("DEVOURER_BACAM")) {
+        auto& d = *reinterpret_cast<RtlUsbAdapter*>(_dev);
+        uint8_t  macid = 1;                  // our AP peer macid (TX-desc / H2C use 1)
+        uint8_t  entry = tid & 0x07;         // one entry per TID for the single peer
+        uint8_t  bmap  = 0;                  // 0 = 64-frame bitmap (default BA window)
+        uint32_t content = (1u)              // valid
+                         | (1u << 1)         // init_req
+                         | ((entry & 0x3u) << 2)
+                         | ((uint32_t)(tid   & 0xf)  << 4)
+                         | ((uint32_t)(macid & 0xff) << 8)
+                         | ((uint32_t)(bmap  & 0xf)  << 16)
+                         | ((uint32_t)(startSsn & 0xfff) << 20);
+        d.rtw_write32(0x0658, content);                          // REG_BACAMCONTENT
+        d.rtw_write32(0x0654, 0x80000000u | 0x40000000u | entry); // poll | write | addr
+        for (int p = 0; p < 20; ++p) {                          // poll until HW clears BIT31
+            if ((d.rtw_read32(0x0654) & 0x80000000u) == 0) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        uint32_t cmdRb = d.rtw_read32(0x0654), contRb = d.rtw_read32(0x0658);
+        SCANLOG("BACAM arm tid=%u entry=%u ssn=%u content=0x%08x -> CMD=0x%08x CONTENT=0x%08x",
+                tid, entry, startSsn, content, cmdRb, contRb);
+    }
     // Respond to EVERY ADDBA Request. A per-TID debounce here was actively
     // harmful: after the connect-time burst set all 8 TID bits, the AP's later
     // re-requests (session timeout / re-establish during streaming) were
@@ -936,6 +1066,57 @@ void ApfpvStation::supervisorLoop() {
         if (s == State::Streaming) {
             backoff = _params.reconnectBackoffMs;   // reset backoff on healthy link
             if (++gratTick >= 10) { gratTick = 0; if (_gratArp) _gratArp(); }  // re-announce ARP ~1s (keep AP entry fresh on lossy links)
+            // PERIODIC RA/RSSI H2C (~1Hz, matching the kernel usbmon cadence). The kernel re-sends
+            // H2C 0x40 (RA/MACID) + 0x42 (RSSI) every ~1s during streaming to keep the firmware's
+            // per-peer rate state fresh; we previously sent them ONCE at connect. Stale FW RA state
+            // may be why the AP rate-controls us conservatively (MCS5/30Mbps) vs the kernel (72Mbps).
+            // Gated by DEVOURER_NO_RA_TICK. Reuses the ~1s gratTick boundary.
+            // RX-FIFO occupancy probe: REG_RXPKT_NUM (0x0284) = # packets in the chip RXPKTBUF,
+            // REG_RXDMA_STATUS (0x0288). If RXPKT_NUM is consistently HIGH during streaming, the
+            // chip can't drain to USB fast enough → FIFO backs up → overflow drops → AP retransmit
+            // (the 6-7% retry). If ~0, the FIFO drains fine and the AP is simply sending ~30Mbps.
+            {
+                auto& dd = *reinterpret_cast<RtlUsbAdapter*>(_dev);
+                try {
+                    uint16_t rxpktnum = dd.rtw_read16(0x0284);
+                    // IGI (RX gain index) — PHYDM/DIG output. Path A = 0xc50[6:0], Path B = 0xe50[6:0].
+                    // Kernel adapts this to ~0x37 (55) at rssi -45. If OURS is parked far off (DIG not
+                    // adapting), our RX is mis-tuned → 6-7% loss → AP caps us. Direct BB read (memory-mapped).
+                    uint32_t igiA = dd.rtw_read32(0x0c50) & 0x7f;
+                    uint32_t igiB = dd.rtw_read32(0x0e50) & 0x7f;
+                    // TX-power index for the rates our compressed BlockAck radiates at. The BA goes
+                    // out at a legacy (CCK/OFDM) basic rate per RRSR, so its airborne power comes from
+                    // the CCK (0xc20) / OFDM-low (0xc24) / OFDM-high (0xc28) TX-AGC regs (path A) and
+                    // 0xe20/0xe28 (path B). Each reg packs 4 per-rate bytes (index 0x00-0x3f, hi=more
+                    // power). If these are LOW, our BAs reach the AP weakly → AP misses them → its BA
+                    // window stalls → link sits ~95% idle (our 27 vs kernel 72 Mbps cap). Byte0 shown.
+                    uint8_t pCckA  = dd.rtw_read8(0x0c20);   // path A CCK1 power idx
+                    uint8_t pOfdmA = dd.rtw_read8(0x0c24);   // path A OFDM6 power idx
+                    uint8_t pO54A  = dd.rtw_read8(0x0c28);   // path A OFDM24-54 power idx
+                    uint8_t pCckB  = dd.rtw_read8(0x0e20);   // path B CCK1
+                    uint8_t pOfdmB = dd.rtw_read8(0x0e24);   // path B OFDM6
+                    static int probeN = 0, rxpktMax = 0; static long rxpktSum = 0;
+                    probeN++; rxpktSum += rxpktnum; if (rxpktnum > rxpktMax) rxpktMax = rxpktnum;
+                    if (probeN >= 10) {   // ~1s
+                        SCANLOG("rx-fifo: RXPKT_NUM avg=%ld max=%d | IGI_A=0x%02x IGI_B=0x%02x (kernel~0x37) "
+                                "| TXPWR A[cck=0x%02x ofdm=0x%02x o54=0x%02x] B[cck=0x%02x ofdm=0x%02x]",
+                                rxpktSum/probeN, rxpktMax, (unsigned)igiA, (unsigned)igiB,
+                                pCckA, pOfdmA, pO54A, pCckB, pOfdmB);
+                        probeN = 0; rxpktMax = 0; rxpktSum = 0;
+                    }
+                } catch (...) {}
+            }
+            if (gratTick == 0 && !std::getenv("DEVOURER_NO_RA_TICK")) {
+                auto& d = *reinterpret_cast<RtlUsbAdapter*>(_dev);
+                uint32_t ra_mask = std::getenv("DEVOURER_RA_CONSERVATIVE") ? 0x3FFFFFFFu : 0xfffff010u;
+                uint8_t ra[7] = { 0x00,  // macid 0 (AP peer)
+                    (uint8_t)((9 & 0x1f) | (1 << 5) | (1 << 7)),          // rate_id9 init_ra1 sgi1
+                    (uint8_t)(2 | (1 << 4)),                               // bw80 | vht
+                    (uint8_t)(ra_mask & 0xff), (uint8_t)((ra_mask >> 8) & 0xff),
+                    (uint8_t)((ra_mask >> 16) & 0xff), (uint8_t)((ra_mask >> 24) & 0xff) };
+                uint8_t rssi[4] = { 0x00, 0x00, 0x39, 0x06 };             // macid0, RSSI (kernel-style)
+                try { d.fillH2CCmd(0x40, 7, ra); d.fillH2CCmd(0x42, 4, rssi); } catch (...) {}
+            }
             bool lost = _deauth.load();
             // RX-silence watchdog: no data/beacon for rxTimeoutMs => link gone.
             if (!lost && (nowMs() - _lastRxMs.load()) > _params.rxTimeoutMs) lost = true;
@@ -971,6 +1152,7 @@ void ApfpvStation::supervisorLoop() {
 
 void ApfpvStation::disconnect() {
     _run.store(false);
+    PhydmWatchdog::SetUnlinked();   // restore monitor-mode DIG bounds (wfb-ng coexistence)
     // Join-safe: NEVER join the current thread (-> EINVAL "Invalid argument" -> uncaught
     // std::system_error -> SIGABRT, seen on replug when the JNI re-init teardown disconnect
     // races/repeats the Java stopAdapters disconnect), and tolerate an already-reaped thread.

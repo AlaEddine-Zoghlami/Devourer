@@ -72,7 +72,7 @@ public class ApfpvStaLink {
     // Carries CREDENTIALS — the thing WfbNgLink never needed.
     public static native long nativeStaInitialize(Context context);
 
-    public static native void nativeStaConnect(long inst, ApfpvStaLink link, int fd, int channel, int bandwidth, String ssid, String pass);
+    public static native void nativeStaConnect(long inst, ApfpvStaLink link, int fd, int channel, int bandwidth, String ssid, String pass, String bssid, String staticIp);
 
     public static native void nativeStaDisconnect(long inst, int fd);
 
@@ -103,7 +103,8 @@ public class ApfpvStaLink {
     /** Instance wrapper: associate this dongle (fd) to the AP in station mode. */
     public void connect(int fd, int channel, int bandwidth, String ssid, String pass) {
         this.currentFd = fd;
-        nativeStaConnect(nativeStaLink, this, fd, channel, bandwidth, ssid, pass);
+        nativeStaConnect(nativeStaLink, this, fd, channel, bandwidth, ssid, pass,
+                         "50:e6:36:7d:54:f3", "");  // Taiga BSSID -> skip DFS scan
     }
     /** Instance wrapper: tear down the station link. */
     public void disconnect() {

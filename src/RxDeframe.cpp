@@ -4,6 +4,7 @@
 // ============================================================================
 #include "RxDeframe.h"
 #include "ApfpvStation.h"
+#include "PhydmWatchdog.h"
 #include <cstring>
 #include <cstdio>
 #include <chrono>
@@ -35,11 +36,15 @@ int RxDeframe::toDbm(uint8_t r) {
 
 void RxDeframe::onPacket(const Packet& pkt) {
     // Layer diagnostic: count frames entering RxDeframe + forwarded to RTP
-    static uint64_t inFrames=0, fwdFrames=0, decryptOk=0;
+    static uint64_t inFrames=0, fwdFrames=0, decryptOk=0, fwdBytes=0;
     static auto layerClock = std::chrono::steady_clock::now();
     inFrames++;
     if (_station) _station->notifyRxAlive();   // any RX = link alive (supervisor)
     if (_lq) _lq->update(toDbm(pkt.RxAtrib.rssi[0]), toDbm(pkt.RxAtrib.rssi[1]));
+    // Feed live RX RSSI to DIG so it uses phydm *connected-mode* boundaries
+    // (IGI floor tracks RSSI ~0x37 @ -45 dBm) instead of monitor coverage
+    // bounds (capped 0x2a → over-gained → FA storm → AP rate-caps us).
+    PhydmWatchdog::SetLinkRssi(toDbm(pkt.RxAtrib.rssi[0]));
 
     const uint8_t* f = pkt.Data.data();
     size_t len = pkt.Data.size();
@@ -114,13 +119,24 @@ void RxDeframe::onPacket(const Packet& pkt) {
     const uint8_t* llc; size_t llcLen;
     auto t0 = std::chrono::steady_clock::now();
     if (fc & 0x4000) {                             // Protected
-        if (!_wpa || !_wpa->ready()) return;
-        if (!_wpa->decryptData(f, len, plainBuf)) {
-            _dbgDecFail++;
-            return;
+        // Lever C.2: if HW CCMP decrypt is on AND the chip already decrypted this frame
+        // (descriptor SWDEC=0 -> bdecrypted), skip the SW AES entirely — the body is
+        // [CCMP hdr 8][plaintext LLC+payload][MIC 8]. This is the lean kernel-style path.
+        // GATED: env cached once; default OFF so the proven SW path stays active.
+        static const bool kHwDecrypt = std::getenv("DEVOURER_HW_DECRYPT") != nullptr;  // OFF by default (no tput gain)
+        if (kHwDecrypt && pkt.RxAtrib.bdecrypted) {
+            if (bodyLen <= 16) return;             // need CCMP hdr(8) + MIC(8)
+            llc = body + 8; llcLen = bodyLen - 16; // strip CCMP header + trailing MIC
+            decryptOk++;
+        } else {
+            if (!_wpa || !_wpa->ready()) return;
+            if (!_wpa->decryptData(f, len, plainBuf)) {
+                _dbgDecFail++;
+                return;
+            }
+            decryptOk++;
+            llc = plainBuf.data(); llcLen = plainBuf.size();
         }
-        decryptOk++;
-        llc = plainBuf.data(); llcLen = plainBuf.size();
     } else { llc = body; llcLen = bodyLen; }
     auto t1 = std::chrono::steady_clock::now();   // after CCMP decrypt (or skip)
 
@@ -233,18 +249,19 @@ void RxDeframe::onPacket(const Packet& pkt) {
     if (ulen < 8 || (size_t)ulen > ipLen - ihl) return;
     const uint8_t* rtp = udp + 8; size_t rtpLen = ulen - 8;
     auto t2 = std::chrono::steady_clock::now();   // after IP decode, before RTP forward
-    if (rtpLen && _onRtp) { _onRtp(rtp, rtpLen); fwdFrames++; }
+    if (rtpLen && _onRtp) { _onRtp(rtp, rtpLen); fwdFrames++; fwdBytes += rtpLen; }
     // Layer health every 1 second
     auto now = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - layerClock).count();
     if (elapsed >= 1000) {
       float secs = (float)elapsed / 1000.0f;
       __android_log_print(4, "rx-layer",
-        "IN=%d/s FWD=%d/s (%.1f%%) decOK=%d/s",
+        "IN=%d/s FWD=%d/s (%.1f%%) decOK=%d/s | GOODPUT=%.1f Mbps",
         (int)(inFrames/secs), (int)(fwdFrames/secs),
         (float)fwdFrames*100.f/(float)(inFrames+1),
-        (int)(decryptOk/secs));
-      inFrames=fwdFrames=decryptOk=0; layerClock = now;
+        (int)(decryptOk/secs),
+        (float)fwdBytes * 8.0f / (secs * 1e6f));
+      inFrames=fwdFrames=decryptOk=0; fwdBytes=0; layerClock = now;
     }
     auto t3 = std::chrono::steady_clock::now();   // after RTP forward (socket send)
 
