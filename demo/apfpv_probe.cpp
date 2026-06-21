@@ -66,12 +66,14 @@ int main(int argc, char** argv) {
     apfpv::ApfpvStation::Params prm;
     prm.ssid = "OpenIPC";
     prm.passphrase = "12345678";
-    prm.scan = true;                 // sweep to find OpenIPC's real channel + BSSID
+    if (const char* s = std::getenv("APFPV_SSID")) prm.ssid = s;
+    if (const char* p = std::getenv("APFPV_PASS")) prm.passphrase = p;
+    prm.scan = true;                 // sweep to find the AP's real channel + BSSID
     prm.channel = 6;                 // hint
     if (const char* c = std::getenv("APFPV_CHANNEL")) prm.channel = atoi(c);
     prm.haveBssid = false;
 
-    printf("=== APFPV station probe: connecting to \"OpenIPC\" ===\n"); fflush(stdout);
+    printf("=== APFPV station probe: connecting to \"%s\" ===\n", prm.ssid.c_str()); fflush(stdout);
     station.connect(prm);
 
     int secs = 25;
