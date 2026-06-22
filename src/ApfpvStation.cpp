@@ -757,6 +757,17 @@ bool ApfpvStation::runConnectChain() {
         // seeing the ADDBA. We were writing several of them WRONG; matching the kernel byte-for-
         // byte is the only lever for the HW auto-BA. Each value is the kernel's final write.
         if (!std::getenv("DEVOURER_SKIP_BAREGS")) {
+            // ★★ REG_RXFLTMAP1 (0x06A2) BIT8 = "accept BAR". The kernel sets this in its
+            // join-complete handler (HW_VAR_ENABLE_RX_BAR). The AP polls us with a BlockAckRequest
+            // after each A-MPDU burst; if BIT8 is clear the HW DROPS the BAR and never emits the
+            // compressed BlockAck → AP DELBAs reason 37. Diagnose+force here in the streaming path
+            // (proves whether our earlier writes survived to connect time). DEVOURER_NO_RXFLT skips.
+            if (!std::getenv("DEVOURER_NO_RXFLT")) {
+                uint16_t fm = dev.rtw_read16(0x06A2);
+                dev.rtw_write16(0x06A2, (uint16_t)(fm | 0x0700)); // BIT8 BAR | BIT9 BA | BIT10 PS-Poll
+                SCANLOG("RXFLTMAP1 0x06A2 before=%04x BAR_bit8=%d -> after=%04x (forced BAR+BA)",
+                        fm, (fm>>8)&1, dev.rtw_read16(0x06A2));
+            }
             // A-MPDU max length: we blasted 0xffffffff; kernel uses a SPECIFIC factor. The all-ones
             // value mis-sizes the HW aggregate handling (BIT31 = RX_AMPDU enable is kept).
             dev.rtw_write32(0x0458, 0xffff0180);   // REG_AMPDU_MAX_LENGTH (kernel operational)
