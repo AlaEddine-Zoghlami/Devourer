@@ -767,16 +767,20 @@ bool ApfpvStation::runConnectChain() {
             // → slow per-A-MPDU cadence → ~30Mbps). Kernel OPERATIONAL (trace line 19277, streaming)
             // = 0x0440=0x5001 + 0x0442=0x20 (robust response rates). Gated by DEVOURER_NO_RRSR.
             if (!std::getenv("DEVOURER_NO_RRSR")) {
-                dev.rtw_write16(0x0440, 0x5001);   // RRSR low (kernel operational)
-                dev.rtw_write8 (0x0442, 0x20);     // RRSR high byte (kernel operational)
+                // ★ GROUND TRUTH from the LIVE kernel mac_reg_dump (0x0440=0x00200150), NOT the
+                // earlier usbmon misread. RRSR = the rate the HW emits ACK/CTS/compressed-BA at.
+                // Our old 0x5001 = 1M(CCK)+MCS0+MCS2 — CCK is UN-TRANSMITTABLE at 5GHz, so our
+                // compressed BA never radiated -> AP got no BA -> DELBA reason 37 -> no aggregation.
+                // 0x0150 = OFDM 6M/12M/24M (proper 5GHz basic response rates). DEVOURER_RRSR_OLD reverts.
+                if (std::getenv("DEVOURER_RRSR_OLD")) dev.rtw_write16(0x0440, 0x5001);
+                else                                  dev.rtw_write16(0x0440, 0x0150);
+                dev.rtw_write8 (0x0442, 0x20);     // RRSR byte2 (kernel live = 0x20)
             }
-            // Response SIFS (Rx→Tx) — the compressed BlockAck must radiate at SIFS or the AP
-            // never sees it and backs its rate-control off to MCS0/20MHz. The FULL kernel SIFS
-            // block, taken from the *operational* (post-connect) writes in the usbmon trace —
-            // NOT the early init values. (Re-derived 2026-06-21 by last-write-wins on the trace.)
-            dev.rtw_write16(0x0514, 0x0e10);       // REG_SIFS_CTX  (kernel 0x0e10; we had 0x100a — WRONG bytes)
-            dev.rtw_write16(0x0516, 0x0e10);       // REG_SIFS_TRX  (kernel 0x0e10; we had 0x100a — WRONG bytes)
-            dev.rtw_write16(0x063A, 0x0e10);       // REG_SIFS (Trx) low=0x10 hi(063B)=0x0E
+            // Response SIFS — LIVE kernel = 0x0e0a (we had 0x0e10 = 6µs too long; the compressed
+            // BA then radiates LATE and the AP misses it). 0x0e0a matches the live mac_reg_dump.
+            dev.rtw_write16(0x0514, 0x0e0a);       // REG_SIFS_CTX  (kernel LIVE 0x0e0a)
+            dev.rtw_write16(0x0516, 0x0e0a);       // REG_SIFS_TRX  (kernel LIVE 0x0e0a)
+            dev.rtw_write16(0x063A, 0x0e0a);       // REG_SIFS (Trx) — kernel LIVE 0x0a/0x0e
             dev.rtw_write8 (0x063C, 0x08);         // SIFS_R2T_CCK  (kernel 0x08)
             dev.rtw_write8 (0x063D, 0x08);         // SIFS_R2T_OFDM (kernel 0x08)
             dev.rtw_write8 (0x063E, 0x0E);         // SIFS_T2T_CCK  (kernel 0x0E)
@@ -1099,7 +1103,10 @@ void ApfpvStation::supervisorLoop() {
                 if (!bbDumped && std::getenv("DEVOURER_BB_DUMP")) {
                     bbDumped = true;
                     try {
-                        for (uint32_t a = 0x800; a <= 0xffc; a += 0x10) {
+                        // MAC BA/protocol region (0x400-0x6fc) + BB (0x800-0xffc) for the
+                        // kernel diff — hunting the MAC reg that enables RX-BA-CAM auto-fill.
+                        for (uint32_t a = 0x400; a <= 0xffc; a += 0x10) {
+                            if (a >= 0x700 && a < 0x800) continue;   // skip FIFO/sensitive gap
                             uint32_t v0 = dd.rtw_read32(a), v1 = dd.rtw_read32(a+4);
                             uint32_t v2 = dd.rtw_read32(a+8), v3 = dd.rtw_read32(a+0xc);
                             SCANLOG("BBDUMP 0x%04x 0x%08x 0x%08x 0x%08x 0x%08x", a, v0, v1, v2, v3);
