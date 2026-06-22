@@ -68,6 +68,9 @@ int main(int argc, char** argv) {
     prm.passphrase = "12345678";
     if (const char* s = std::getenv("APFPV_SSID")) prm.ssid = s;
     if (const char* p = std::getenv("APFPV_PASS")) prm.passphrase = p;
+    prm.bandwidth = 80;              // 80 MHz for full throughput (phone app uses 80; the
+                                     // Params default is 20 — without this the probe caps at 20 MHz)
+    if (const char* b = std::getenv("APFPV_BW")) prm.bandwidth = atoi(b);
     prm.scan = true;                 // sweep to find the AP's real channel + BSSID
     prm.channel = 6;                 // hint
     if (const char* c = std::getenv("APFPV_CHANNEL")) prm.channel = atoi(c);

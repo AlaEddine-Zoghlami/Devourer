@@ -25,12 +25,11 @@
 #include "RadioManagementModule.h"
 #include <algorithm>
 #include <cstring>
-#ifdef __ANDROID__
+// Platform-agnostic: <android/log.h> is the NDK header on Android and the
+// compat stderr shim on native host builds (see WiFiDriver/compat), so the same
+// diagnostics surface on Windows/Linux too — essential for chasing parity.
 #include <android/log.h>
 #define SCANLOG(...) __android_log_print(ANDROID_LOG_INFO, "apfpv-scan", __VA_ARGS__)
-#else
-#define SCANLOG(...) ((void)0)
-#endif
 
 namespace apfpv {
 
