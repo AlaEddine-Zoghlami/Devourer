@@ -1031,13 +1031,25 @@ void ApfpvStation::handleAddbaRequest(const uint8_t* frame, size_t len) {
     memcpy(txf.data()+40, r.data(), r.size());
     FillStationTxDesc(txf.data(), (uint16_t)r.size(), 40,
                       1, StationFrameKind::Mgmt, 0x0c, 0x04);
-    // send_packet (raw-fd USBDEVFS_BULK): non-blocking, ~µs completion via
-    // kernel USB stack. The chip's MAC hardware updates TXPKT_EMPTY when the
-    // frame drains, regardless of whether WE poll it — the firmware reads the
-    // same hardware register. sendStationFrameSync blocks too long (80ms for
-    // 8 TIDs), starving RX and causing decryption failures.
-    dev.send_packet(txf.data(), txf.size());
-    SCANLOG("ADDBA Response tid=%u (raw-fd send_packet)", tid);
+    // RELIABLE ADDBA-Response delivery — the crux of the 28-vs-59 gap. The kernel uses
+    // issue_addba_rsp_wait_ack() (3 retries, wait for the AP's ACK). We sent ONCE,
+    // fire-and-forget; when that single copy is lost over-air the AP never learns we
+    // accepted -> DELBA reason 37 ("peer doesn't want BA") -> re-ADDBA loop -> the BA
+    // session never stays up -> intermittent A-MPDU -> ~half throughput. We can't easily
+    // detect the 802.11 ACK on the libusb path, so blind-retry: for the VIDEO TID (0) send
+    // 3x via the synchronous (TX-drain-confirmed) path so it's rock-solid; idle TIDs keep
+    // the cheap single async send (their teardown is harmless). DEVOURER_ADDBA_ASYNC reverts.
+    // Measured: making tid=0 reliable drove DELBA 56->0 (BA stable) but did NOT raise
+    // throughput (still ~25; the cap is the AP's per-STA delivery rate, not BA stability),
+    // and the 3x sync starves RX ~30ms/burst. So keep the cheap async send by DEFAULT;
+    // DEVOURER_ADDBA_RELIABLE opts into the kernel-style reliable (3x sync) tid=0 path.
+    if (tid == 0 && std::getenv("DEVOURER_ADDBA_RELIABLE")) {
+        for (int rep = 0; rep < 3; ++rep) dev.sendStationFrameSync(txf.data(), txf.size());
+        SCANLOG("ADDBA Response tid=0 (3x reliable sync)");
+    } else {
+        dev.send_packet(txf.data(), txf.size());
+        SCANLOG("ADDBA Response tid=%u (async)", tid);
+    }
 }
 
 bool ApfpvStation::connect(const Params& p) {
