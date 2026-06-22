@@ -225,8 +225,8 @@ void RxDeframe::onPacket(const Packet& pkt) {
                 // Health summary every 120 unique pkts: received / dup-dropped / decrypt-failed / lost.
                 if ((_dbgRx % 120) == 0)
                     __android_log_print(ANDROID_LOG_INFO, "rxd-health",
-                        "rx=%d dropDup=%d decFail=%d lost=%d (pt=%u seq=%u) rxrate=%u bw=%u",
-                        _dbgRx, _dbgDrop, _dbgDecFail, _dbgLoss, pt, sq,
+                        "rx=%d dropDup=%d decFail=%d lost=%d amsdu=%d sub=%d (pt=%u seq=%u) rxrate=%u bw=%u",
+                        _dbgRx, _dbgDrop, _dbgDecFail, _dbgLoss, _dbgAmsdu, _dbgAmsduSub, pt, sq,
                         (unsigned)pkt.RxAtrib.data_rate, (unsigned)pkt.RxAtrib.bw);
                         // rxrate: 0-3=CCK 1/2/5.5/11, 4-11=OFDM 6..54, 12-27=HT MCS0-15,
                         // 28+=VHT. Low (<12) => rate-control collapsed (ACK problem);
@@ -277,10 +277,12 @@ void RxDeframe::onPacket(const Packet& pkt) {
     if (amsdu) {
         // Walk A-MSDU subframes: [DA(6)|SA(6)|len(2)|MSDU(len bytes)|pad to 4B] (no pad on last).
         // Each MSDU is its own LLC/SNAP packet — the AP coalesced several into one ACKed MPDU.
+        _dbgAmsdu++;
         size_t off = 0;
         while (off + 14 <= llcLen) {
             uint16_t sub = (uint16_t)((llc[off + 12] << 8) | llc[off + 13]);
             if (sub < 8 || off + 14 + sub > llcLen) break;     // truncated/garbage -> stop
+            _dbgAmsduSub++;
             deliverMsdu(llc + off + 14, sub);                  // MSDU starts with its LLC/SNAP
             off = (off + 14 + sub + 3) & ~size_t(3);           // next subframe is 4-byte aligned
         }

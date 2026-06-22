@@ -45,6 +45,7 @@ private:
     // RX-health instrumentation (logged to logcat tag "rxd-health"): decrypt failures + RTP-seq-gap
     // loss, to diagnose dongle jumps/rewinds (loss vs duplication vs decrypt failure).
     int      _dbgDecFail = 0, _dbgLoss = 0;
+    int      _dbgAmsdu = 0, _dbgAmsduSub = 0;   // A-MSDU frames seen + total subframes de-aggregated
     uint16_t _lastSeq[128] = {};
     bool     _lastSeqV[128] = {};
     // Bottleneck diag: cumulative time (ns) spent in onPacket phases per interval
