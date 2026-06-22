@@ -71,6 +71,11 @@ void RxDeframe::onPacket(const Packet& pkt) {
                     "ADDBA-REQ-IN dialog=%u param=0x%04x policy=%u tid=%u bufsz=%u timeout=%u startSeq=%u",
                     b[2], p, (p>>1)&1, (p>>2)&0x0f, (p>>6)&0x3ff,
                     b[5]|(b[6]<<8), (b[7]|(b[8]<<8))>>4);
+            } else if (b[0] == 0x03 && b[1] == 0x02 && len >= 24 + 6) {
+                // DELBA: param[2-3] = {initiator bit11, TID bits12-15}, reason[4-5].
+                u16 dp = b[2] | (b[3] << 8);
+                __android_log_print(4, "apfpv-scan", "DELBA-IN tid=%u initiator=%u reason=%u",
+                    (dp >> 12) & 0xf, (dp >> 11) & 1, (unsigned)(b[4] | (b[5] << 8)));
             } else {
                 __android_log_print(4, "apfpv-scan", "ACTION-RX cat=%u act=%u", b[0], b[1]);
             }
