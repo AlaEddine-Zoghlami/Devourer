@@ -1112,14 +1112,20 @@ void ApfpvStation::supervisorLoop() {
             }
             if (gratTick == 0 && !std::getenv("DEVOURER_NO_RA_TICK")) {
                 auto& d = *reinterpret_cast<RtlUsbAdapter*>(_dev);
-                uint32_t ra_mask = std::getenv("DEVOURER_RA_CONSERVATIVE") ? 0x3FFFFFFFu : 0xfffff010u;
-                uint8_t ra[7] = { 0x00,  // macid 0 (AP peer)
-                    (uint8_t)((9 & 0x1f) | (1 << 5) | (1 << 7)),          // rate_id9 init_ra1 sgi1
-                    (uint8_t)(2 | (1 << 4)),                               // bw80 | vht
-                    (uint8_t)(ra_mask & 0xff), (uint8_t)((ra_mask >> 8) & 0xff),
-                    (uint8_t)((ra_mask >> 16) & 0xff), (uint8_t)((ra_mask >> 24) & 0xff) };
-                uint8_t rssi[4] = { 0x00, 0x00, 0x39, 0x06 };             // macid0, RSSI (kernel-style)
-                try { d.fillH2CCmd(0x40, 7, ra); d.fillH2CCmd(0x42, 4, rssi); } catch (...) {}
+                // Kernel-verbatim MACID_CFG + RSSI (usbmon: [00,89,1a,00,80,ff,ff] / [00,00,2e]).
+                // DEVOURER_RA_OLD restores the prior (wrong) values for A/B. See StationMode.cpp.
+                if (std::getenv("DEVOURER_RA_OLD")) {
+                    uint32_t ra_mask = std::getenv("DEVOURER_RA_CONSERVATIVE") ? 0x3FFFFFFFu : 0xfffff010u;
+                    uint8_t ra[7] = { 0x00, (uint8_t)((9 & 0x1f) | (1 << 5) | (1 << 7)), (uint8_t)(2 | (1 << 4)),
+                        (uint8_t)(ra_mask & 0xff), (uint8_t)((ra_mask >> 8) & 0xff),
+                        (uint8_t)((ra_mask >> 16) & 0xff), (uint8_t)((ra_mask >> 24) & 0xff) };
+                    uint8_t rssi[4] = { 0x00, 0x00, 0x39, 0x06 };
+                    try { d.fillH2CCmd(0x40, 7, ra); d.fillH2CCmd(0x42, 4, rssi); } catch (...) {}
+                } else {
+                    uint8_t ra[7] = { 0x00, 0x89, 0x1a, 0x00, 0x80, 0xff, 0xff };   // kernel-verbatim
+                    uint8_t rssi[3] = { 0x00, 0x00, 0x2e };                          // kernel-verbatim
+                    try { d.fillH2CCmd(0x40, 7, ra); d.fillH2CCmd(0x42, 3, rssi); } catch (...) {}
+                }
             }
             bool lost = _deauth.load();
             // RX-silence watchdog: no data/beacon for rxTimeoutMs => link gone.
