@@ -1064,7 +1064,12 @@ void ApfpvStation::supervisorLoop() {
 
         if (s == State::Streaming) {
             backoff = _params.reconnectBackoffMs;   // reset backoff on healthy link
-            if (++gratTick >= 10) { gratTick = 0; if (_gratArp) _gratArp(); }  // re-announce ARP ~1s (keep AP entry fresh on lossy links)
+            // Keepalive cadence: ~1s normally. DEVOURER_KEEPALIVE=1 fires every loop (~100ms) —
+            // a power-save probe: if the AP buffers our downlink because it thinks the injected
+            // station is asleep, a frequent uplink data frame (PWR_MGT=0) keeps us "awake" and the
+            // AP delivers continuously instead of dribbling. If throughput jumps, PS-buffering was it.
+            static const int kaEvery = std::getenv("DEVOURER_KEEPALIVE") ? 1 : 10;
+            if (++gratTick >= kaEvery) { gratTick = 0; if (_gratArp) _gratArp(); }  // re-announce ARP (keep AP entry fresh)
             // PERIODIC RA/RSSI H2C (~1Hz, matching the kernel usbmon cadence). The kernel re-sends
             // H2C 0x40 (RA/MACID) + 0x42 (RSSI) every ~1s during streaming to keep the firmware's
             // per-peer rate state fresh; we previously sent them ONCE at connect. Stale FW RA state
