@@ -122,7 +122,6 @@ void RxDeframe::onPacket(const Packet& pkt) {
     // Pre-allocated buffer per thread — avoids heap alloc per packet (5600/s at 65Mbps)
     static thread_local std::vector<uint8_t> plainBuf(2048);
     const uint8_t* llc; size_t llcLen;
-    auto t0 = std::chrono::steady_clock::now();
     if (fc & 0x4000) {                             // Protected
         // Lever C.2: if HW CCMP decrypt is on AND the chip already decrypted this frame
         // (descriptor SWDEC=0 -> bdecrypted), skip the SW AES entirely — the body is
@@ -143,7 +142,6 @@ void RxDeframe::onPacket(const Packet& pkt) {
             llc = plainBuf.data(); llcLen = plainBuf.size();
         }
     } else { llc = body; llcLen = bodyLen; }
-    auto t1 = std::chrono::steady_clock::now();   // after CCMP decrypt (or skip)
 
     if (llcLen < 8) return;
     static const uint8_t snap[6] = {0xaa,0xaa,0x03,0x00,0x00,0x00};
@@ -206,11 +204,10 @@ void RxDeframe::onPacket(const Packet& pkt) {
                 uint8_t  pt = r[1] & 0x7f;
                 uint16_t sq = (uint16_t)((r[2] << 8) | r[3]);
                 _dbgRx++;
-                // Window de-dup: a retransmit reuses the RTP seq but can arrive reordered,
-                // so check the last 128 seqs for this pt (not just the previous packet).
-                bool dup = false;
-                for (int i = 0; i < 128; i++) if (_seqValid[pt][i] && _seqHist[pt][i] == sq) { dup = true; break; }
-                if (dup) { _dbgDrop++; return; }   // duplicate -> drop before _onIp + shortcut
+                // NOTE: the RTP-seq de-dup loop (128-elem scan/pkt) was REMOVED — it was dead
+                // code (dropDup=0 every run). The CCMP PN-replay window already drops every
+                // 802.11 retransmit (same PN) at decrypt time, before this point. One less
+                // 716k-iter/s linear scan in the hot path.
                 // RX-seq-gap loss: how many packets between this and the last UNIQUE one for this pt.
                 if (_lastSeqV[pt]) {
                     int gap = (int)(uint16_t)(sq - _lastSeq[pt]);
@@ -226,8 +223,6 @@ void RxDeframe::onPacket(const Packet& pkt) {
                         // rxrate: 0-3=CCK 1/2/5.5/11, 4-11=OFDM 6..54, 12-27=HT MCS0-15,
                         // 28+=VHT. Low (<12) => rate-control collapsed (ACK problem);
                         // high MCS but sparse rx => A-MPDU/Block-Ack aggregation missing.
-                _seqHist[pt][_seqPos[pt]] = sq; _seqValid[pt][_seqPos[pt]] = true;
-                _seqPos[pt] = (uint8_t)((_seqPos[pt] + 1) & 127);
             }
         }
     }
@@ -253,7 +248,6 @@ void RxDeframe::onPacket(const Packet& pkt) {
     uint16_t ulen = udlen;
     if (ulen < 8 || (size_t)ulen > ipLen - ihl) return;
     const uint8_t* rtp = udp + 8; size_t rtpLen = ulen - 8;
-    auto t2 = std::chrono::steady_clock::now();   // after IP decode, before RTP forward
     if (rtpLen && _onRtp) { _onRtp(rtp, rtpLen); fwdFrames++; fwdBytes += rtpLen; }
     // Layer health every 1 second
     auto now = std::chrono::steady_clock::now();
@@ -268,27 +262,8 @@ void RxDeframe::onPacket(const Packet& pkt) {
         (float)fwdBytes * 8.0f / (secs * 1e6f));
       inFrames=fwdFrames=decryptOk=0; fwdBytes=0; layerClock = now;
     }
-    auto t3 = std::chrono::steady_clock::now();   // after RTP forward (socket send)
-
-    // --- bottleneck diag: timing breakdown every RX_DIAG_INTERVAL packets ---
-    {
-        using namespace std::chrono;
-        _diagPkts++;
-        _diagTotalNs += duration_cast<nanoseconds>(t3 - t0).count();
-        _diagDecNs   += duration_cast<nanoseconds>(t1 - t0).count();  // CCMP decrypt
-        _diagFwdNs   += duration_cast<nanoseconds>(t3 - t2).count();  // RTP sendto()
-        if ((_diagPkts % RX_DIAG_INTERVAL) == 0) {
-            int64_t avgTotal = _diagTotalNs / _diagPkts;
-            int64_t avgDec   = _diagDecNs / _diagPkts;
-            int64_t avgIp    = (_diagTotalNs - _diagDecNs - _diagFwdNs) / _diagPkts; // IP decode
-            int64_t avgFwd   = _diagFwdNs / _diagPkts;
-            __android_log_print(ANDROID_LOG_WARN, "rxd-diag",
-                "pkts=%d total=%lldns | CCMP=%lldns IP=%lldns fwd=%lldns",
-                _diagPkts, (long long)avgTotal, (long long)avgDec,
-                (long long)avgIp, (long long)avgFwd);
-            _diagTotalNs = _diagDecNs = _diagFwdNs = _diagPkts = 0;
-        }
-    }
+    // (removed: per-frame t0..t3 timing + rxd-diag breakdown — 4 steady_clock::now()/frame of
+    //  pure profiling overhead; the 1s rx-layer GOODPUT line above is enough.)
 }
 
 // A-MPDU per-TID reorder buffer (kernel: recv_indicatepkt_reorder).
