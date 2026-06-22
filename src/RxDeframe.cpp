@@ -117,6 +117,11 @@ void RxDeframe::onPacket(const Packet& pkt) {
                                                    // M1 is QoS-data fc=0x0288, so this was the
                                                    // header-offset bug that hid the handshake)
     if (len <= hdrLen) return;
+    // A-MSDU Present = bit 7 of the QoS Control field (the last 2B of the header, present only
+    // for QoS data). When set, the (decrypted) MSDU body is a chain of [DA|SA|len|sub-MSDU]
+    // subframes, NOT a bare LLC/SNAP. The greg VTX uses this WITH rtw_ampdu_enable=0 to
+    // aggregate several packets into one normally-ACKed MPDU — throughput gain without BlockAck.
+    const bool amsdu = (fc & 0x0080) && (f[hdrLen - 2] & 0x80);
 
     const uint8_t* body = f + hdrLen; size_t bodyLen = len - hdrLen;
     // Pre-allocated buffer per thread — avoids heap alloc per packet (5600/s at 65Mbps)
@@ -143,6 +148,9 @@ void RxDeframe::onPacket(const Packet& pkt) {
         }
     } else { llc = body; llcLen = bodyLen; }
 
+    // Deliver ONE MSDU (LLC/SNAP + payload) up the stack. Called once for a normal frame, or
+    // once per subframe for an A-MSDU. Early `return` = skip THIS MSDU (move to the next).
+    auto deliverMsdu = [&](const uint8_t* llc, size_t llcLen) {
     if (llcLen < 8) return;
     static const uint8_t snap[6] = {0xaa,0xaa,0x03,0x00,0x00,0x00};
     if (std::memcmp(llc, snap, 6) != 0) return;
@@ -264,6 +272,21 @@ void RxDeframe::onPacket(const Packet& pkt) {
     }
     // (removed: per-frame t0..t3 timing + rxd-diag breakdown — 4 steady_clock::now()/frame of
     //  pure profiling overhead; the 1s rx-layer GOODPUT line above is enough.)
+    };  // end deliverMsdu
+
+    if (amsdu) {
+        // Walk A-MSDU subframes: [DA(6)|SA(6)|len(2)|MSDU(len bytes)|pad to 4B] (no pad on last).
+        // Each MSDU is its own LLC/SNAP packet — the AP coalesced several into one ACKed MPDU.
+        size_t off = 0;
+        while (off + 14 <= llcLen) {
+            uint16_t sub = (uint16_t)((llc[off + 12] << 8) | llc[off + 13]);
+            if (sub < 8 || off + 14 + sub > llcLen) break;     // truncated/garbage -> stop
+            deliverMsdu(llc + off + 14, sub);                  // MSDU starts with its LLC/SNAP
+            off = (off + 14 + sub + 3) & ~size_t(3);           // next subframe is 4-byte aligned
+        }
+    } else {
+        deliverMsdu(llc, llcLen);                              // normal single-MSDU frame
+    }
 }
 
 // A-MPDU per-TID reorder buffer (kernel: recv_indicatepkt_reorder).
