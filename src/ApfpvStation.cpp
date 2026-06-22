@@ -768,6 +768,36 @@ bool ApfpvStation::runConnectChain() {
                 SCANLOG("RXFLTMAP1 0x06A2 before=%04x BAR_bit8=%d -> after=%04x (forced BAR+BA)",
                         fm, (fm>>8)&1, dev.rtw_read16(0x06A2));
             }
+            // ★★ TEST 3 (DEVOURER_T3_WAKE): MACID sleep/wake state — a HW state machine we never
+            // drove. The kernel calls rtw_hal_macid_wakeup(psta->mac_id) on join. If our AP-peer
+            // macid's bit is SET in REG_MACID_SLEEP (0x04D4 / _1 0x0488 / _2 0x04D0 / _3 0x0484),
+            // the HW thinks the peer is power-save asleep and PS-BUFFERS our TX to it — including
+            // the SIFS compressed BlockAck → the BA never radiates → AP DELBA reason 37. Read the
+            // state, then wake ALL macids (clear the sleep bitmaps). Default ON (it's correct for
+            // a station); DEVOURER_NO_T3WAKE reverts.
+            if (!std::getenv("DEVOURER_NO_T3WAKE")) {
+                uint32_t s0 = dev.rtw_read32(0x04D4), s1 = dev.rtw_read32(0x0488);
+                uint32_t s2 = dev.rtw_read32(0x04D0), s3 = dev.rtw_read32(0x0484);
+                dev.rtw_write32(0x04D4, 0); dev.rtw_write32(0x0488, 0);
+                dev.rtw_write32(0x04D0, 0); dev.rtw_write32(0x0484, 0);
+                SCANLOG("MACID_SLEEP before: 0x4D4=%08x 0x488=%08x 0x4D0=%08x 0x484=%08x (macid0_asleep=%d) -> woke all",
+                        s0, s1, s2, s3, (int)(s0 & 1));
+            }
+            // TEST 4 (DEVOURER_T4_JOIN): remaining join-state regs we never set, from the LIVE
+            // kernel dump — REG_BCN_INTERVAL/retry region 0x0540=0x80006404, 0x0544=0x00400180,
+            // and REG_RETRY_LIMIT (0x0541 byte within 0x0540) RL_VAL_STA=0x3030. The HW's beacon/
+            // TSF window + TX retry shape the response/BA timing. DEVOURER_NO_T4 reverts.
+            if (std::getenv("DEVOURER_T4_JOIN")) {
+                dev.rtw_write32(0x0540, 0x80006404);   // BCN_INTERVAL region (live kernel)
+                dev.rtw_write32(0x0544, 0x00400180);   // (live kernel)
+                dev.rtw_write16(0x0541, 0x3030);       // REG_RETRY_LIMIT short|long = 0x30 (RL_VAL_STA)
+                // TSF SYNC VERIFY: read REG_TSFTR (0x0560 low / 0x0564 high). If TSF is synced+running
+                // it is a large value counting up ~1e6/sec; if frozen/0 the HW never synced to the AP.
+                uint32_t tsfL = dev.rtw_read32(0x0560), tsfH = dev.rtw_read32(0x0564);
+                uint8_t bcn = dev.rtw_read8(0x0550);   // REG_BCN_CTRL — bit4(0x10)=DIS_TSF_UDT
+                SCANLOG("T4 join-state set; TSF=0x%08x%08x BCN_CTRL=0x%02x (DIS_TSF_UDT=%d)",
+                        tsfH, tsfL, bcn, (bcn>>4)&1);
+            }
             // A-MPDU max length: we blasted 0xffffffff; kernel uses a SPECIFIC factor. The all-ones
             // value mis-sizes the HW aggregate handling (BIT31 = RX_AMPDU enable is kept).
             dev.rtw_write32(0x0458, 0xffff0180);   // REG_AMPDU_MAX_LENGTH (kernel operational)
@@ -1109,8 +1139,12 @@ void ApfpvStation::supervisorLoop() {
             // a power-save probe: if the AP buffers our downlink because it thinks the injected
             // station is asleep, a frequent uplink data frame (PWR_MGT=0) keeps us "awake" and the
             // AP delivers continuously instead of dribbling. If throughput jumps, PS-buffering was it.
+            // TEST 1 (DEVOURER_T1_QUIET): make the supervisor fully silent during streaming —
+            // no uplink ARP TX, no H2C, no diagnostic control-reads — so NOTHING of ours contends
+            // with the RX/BA path on the USB bus. Tests the "flushing frames out of the HW" thesis.
+            const bool t1quiet = std::getenv("DEVOURER_T1_QUIET") != nullptr;
             static const int kaEvery = std::getenv("DEVOURER_KEEPALIVE") ? 1 : 10;
-            if (++gratTick >= kaEvery) { gratTick = 0; if (_gratArp) _gratArp(); }  // re-announce ARP (keep AP entry fresh)
+            if (++gratTick >= kaEvery) { gratTick = 0; if (_gratArp && !t1quiet) _gratArp(); }  // re-announce ARP (keep AP entry fresh)
             // PERIODIC RA/RSSI H2C (~1Hz, matching the kernel usbmon cadence). The kernel re-sends
             // H2C 0x40 (RA/MACID) + 0x42 (RSSI) every ~1s during streaming to keep the firmware's
             // per-peer rate state fresh; we previously sent them ONCE at connect. Stale FW RA state
@@ -1120,7 +1154,7 @@ void ApfpvStation::supervisorLoop() {
             // REG_RXDMA_STATUS (0x0288). If RXPKT_NUM is consistently HIGH during streaming, the
             // chip can't drain to USB fast enough → FIFO backs up → overflow drops → AP retransmit
             // (the 6-7% retry). If ~0, the FIFO drains fine and the AP is simply sending ~30Mbps.
-            {
+            if (!t1quiet) {
                 auto& dd = *reinterpret_cast<RtlUsbAdapter*>(_dev);
                 // One-shot full BB-register dump (0x800-0xffc) to diff against the kernel's
                 // bb_reg_dump and find the 2-stream MIMO RX config difference (we get 1SS, kernel 2SS).
@@ -1167,7 +1201,7 @@ void ApfpvStation::supervisorLoop() {
                     }
                 } catch (...) {}
             }
-            if (gratTick == 0 && !std::getenv("DEVOURER_NO_RA_TICK")) {
+            if (gratTick == 0 && !t1quiet && !std::getenv("DEVOURER_NO_RA_TICK")) {
                 auto& d = *reinterpret_cast<RtlUsbAdapter*>(_dev);
                 // Kernel-verbatim MACID_CFG + RSSI (usbmon: [00,89,1a,00,80,ff,ff] / [00,00,2e]).
                 // DEVOURER_RA_OLD restores the prior (wrong) values for A/B. See StationMode.cpp.
