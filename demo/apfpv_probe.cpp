@@ -74,10 +74,18 @@ int main(int argc, char** argv) {
     prm.scan = true;                 // sweep to find the AP's real channel + BSSID
     prm.channel = 6;                 // hint
     if (const char* c = std::getenv("APFPV_CHANNEL")) prm.channel = atoi(c);
+    // Static-IP (skip DHCP) — for the Windows ICS hotspot that won't lease.
+    // APFPV_STATIC_IP="192.168.137.50" APFPV_STATIC_GW="192.168.137.1"
+    if (const char* sip = std::getenv("APFPV_STATIC_IP")) {
+        unsigned a,b,c2,d; if (sscanf(sip,"%u.%u.%u.%u",&a,&b,&c2,&d)==4) prm.staticIp=(a<<24)|(b<<16)|(c2<<8)|d;
+        prm.staticNetmask = 0xFFFFFF00u;
+        if (const char* gw = std::getenv("APFPV_STATIC_GW")) { unsigned e,f,g,h; if (sscanf(gw,"%u.%u.%u.%u",&e,&f,&g,&h)==4) prm.staticGateway=(e<<24)|(f<<16)|(g<<8)|h; }
+    }
     prm.haveBssid = false;
 
     printf("=== APFPV station probe: connecting to \"%s\" ===\n", prm.ssid.c_str()); fflush(stdout);
     station.connect(prm);
+    if (prm.staticIp) { fprintf(stderr, "ip=%u.%u.%u.%u (static)\n", (prm.staticIp>>24)&255,(prm.staticIp>>16)&255,(prm.staticIp>>8)&255,prm.staticIp&255); fflush(stderr); }
 
     int secs = 25;
     if (const char* s = std::getenv("APFPV_SECONDS")) secs = atoi(s);
