@@ -1081,6 +1081,19 @@ void ApfpvStation::supervisorLoop() {
             // (the 6-7% retry). If ~0, the FIFO drains fine and the AP is simply sending ~30Mbps.
             {
                 auto& dd = *reinterpret_cast<RtlUsbAdapter*>(_dev);
+                // One-shot full BB-register dump (0x800-0xffc) to diff against the kernel's
+                // bb_reg_dump and find the 2-stream MIMO RX config difference (we get 1SS, kernel 2SS).
+                static bool bbDumped = false;
+                if (!bbDumped && std::getenv("DEVOURER_BB_DUMP")) {
+                    bbDumped = true;
+                    try {
+                        for (uint32_t a = 0x800; a <= 0xffc; a += 0x10) {
+                            uint32_t v0 = dd.rtw_read32(a), v1 = dd.rtw_read32(a+4);
+                            uint32_t v2 = dd.rtw_read32(a+8), v3 = dd.rtw_read32(a+0xc);
+                            SCANLOG("BBDUMP 0x%04x 0x%08x 0x%08x 0x%08x 0x%08x", a, v0, v1, v2, v3);
+                        }
+                    } catch (...) {}
+                }
                 try {
                     uint16_t rxpktnum = dd.rtw_read16(0x0284);
                     // IGI (RX gain index) — PHYDM/DIG output. Path A = 0xc50[6:0], Path B = 0xe50[6:0].
