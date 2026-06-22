@@ -760,7 +760,17 @@ bool ApfpvStation::runConnectChain() {
             // A-MPDU max length: we blasted 0xffffffff; kernel uses a SPECIFIC factor. The all-ones
             // value mis-sizes the HW aggregate handling (BIT31 = RX_AMPDU enable is kept).
             dev.rtw_write32(0x0458, 0xffff0180);   // REG_AMPDU_MAX_LENGTH (kernel operational)
-            dev.rtw_write32(0x0420, 0x001f71ff);   // aggregation ctrl (kernel operational)
+            // ★ 0x0420 REG_FWHW_TXQ_CTRL — GROUND TRUTH from the LIVE kernel mac_reg_dump while
+            // streaming @867Mbps with RX-BA active = 0xff311f00. We were writing 0x001f71ff (a
+            // usbmon misread). This reg governs the HW TX/RESPONSE queues (where the chip auto-
+            // generates ACK/compressed-BA). If anything host-side gates the HW BA-response
+            // generation, this is it. DEVOURER_TXQ_OLD reverts to the old (wrong) value.
+            if (std::getenv("DEVOURER_TXQ_OLD")) dev.rtw_write32(0x0420, 0x001f71ff);
+            else                                 dev.rtw_write32(0x0420, 0xff311f00);
+            dev.rtw_write32(0x0424, 0x3e30f7f7);   // REG_HWSEQ_CTRL — LIVE kernel (was 0x1230f9f9)
+            dev.rtw_write32(0x04f0, 0x0000c100);   // LIVE kernel (was 0x04014100)
+            { uint32_t rb = dev.rtw_read32(0x0420);
+              SCANLOG("LIVEREG 0x0420 wrote=ff311f00 readback=%08x (status bytes may differ)", rb); }
             // REG_RRSR (0x0440, Response Rate Set): the rates our HW sends ACK/CTS/BlockAck at.
             // We used 0x00000fff (kernel INIT value = all rates) → the HW may answer high-MCS data
             // with a too-aggressive BA the AP misses on the weaker uplink (our measured 4-7% retry
@@ -796,8 +806,12 @@ bool ApfpvStation::runConnectChain() {
             // EDCA BE: kernel operational = 0x2ba45e00 (line 20081). Our prior 0x2ba40000 came
             // from a transient init write (line 19287) and zeroed the TXOP-limit field, hurting
             // aggregation. Restore the operational value.
-            dev.rtw_write32(0x0508, 0x2ba45e00);   // REG_EDCA_BE_PARAM (kernel operational)
-            SCANLOG("BA-regs kernel-OPERATIONAL: SIFS_CTX/TRX=0e10 063a=0e10 RESP_SIFS=08080E0A 0607|=07 0508=2ba45e00 SLOT=09");
+            // ★ EDCA_BE — LIVE kernel = 0x005ea42b. Our 0x2ba45e00 had AIFS=0x00 (transmit with
+            // ZERO arbitration spacing) + TXOP=0x2ba4 — both wrong (byte-order mangled). The live
+            // value: AIFS=0x2b, CWmin/max=0xa4, TXOP=0x005e. DEVOURER_EDCA_OLD reverts.
+            if (std::getenv("DEVOURER_EDCA_OLD")) dev.rtw_write32(0x0508, 0x2ba45e00);
+            else                                  dev.rtw_write32(0x0508, 0x005ea42b);
+            SCANLOG("BA-regs LIVE-kernel: 0x0420=ff311f00 0x0424=3e30f7f7 0x04f0=0000c100 0x0508=005ea42b RRSR=0150/20 SIFS=0e0a 0607|=07");
         }
         // NOTE: a "KPROTO replay" experiment (set the 96 MAC registers the kernel writes that we
         // don't — 0x0668 base, SECCFG, BFMER0/CSI_RPT VHT-sounding, SND_PTCL) was tested 2026-06-21
