@@ -743,7 +743,13 @@ bool ApfpvStation::runConnectChain() {
                 (unsigned)_wpa->gtkKeyId());
     }
 
-    if (!std::getenv("DEVOURER_SKIP_ADDBA")) {
+    // BlockAck is DISABLED by default. This dongle's MAC cannot emit the SIFS compressed
+    // BlockAck (silicon, [[apfpv-hw-blockack-fix]]), so initiating BA only makes the AP
+    // aggregate frames it can't ACK -> the AP retransmits -> PN-replay decFail -> ~3x
+    // throughput loss on an A-MPDU-on AP (measured Taiga: 8 -> 22 median / 35 peak Mbps when
+    // BA is declined instead). Opt back into the old BA-initiating + BA-register path with
+    // DEVOURER_ENABLE_BA (e.g. to re-test the HW auto-BA hypothesis on a kernel-matched AP).
+    if (std::getenv("DEVOURER_ENABLE_BA")) {
         // REG_AMPDU_MIN_SPACE: the kernel does NOT write this (leaves chip default). We forced
         // 7 = 16µs min MPDU spacing, which over-restricts the AP's downlink A-MPDU packing (at
         // high MCS a 1.5KB frame is <16µs, so 16µs spacing pads/caps the aggregate → the ~30Mbps
@@ -1074,8 +1080,16 @@ void ApfpvStation::handleAddbaRequest(const uint8_t* frame, size_t len) {
     // extra 2 bytes made the frame malformed and some APs silently reject it (so
     // they never aggregate). Echo the AP's BA param set + timeout verbatim.
     u8 dialog = body[2];
+    // DECLINE the AP's ADDBA by default: this dongle can never emit the SIFS compressed
+    // BlockAck (MAC-silicon, not host-reachable), so on an A-MPDU-on AP every aggregate it
+    // can't ACK is retransmitted -> arrives as PN-replay -> ~50% decFail. Replying StatusCode
+    // 37 (REFUSED) forces the AP to stop aggregating this TID, trading aggregation gain we
+    // can't use for a clean non-aggregated stream (no PN-replay). DEVOURER_ENABLE_BA accepts
+    // (StatusCode 0) to restore the old behavior.
+    const bool declineBa = std::getenv("DEVOURER_ENABLE_BA") == nullptr;
     r.push_back(0x03); r.push_back(0x01); r.push_back(dialog);
-    r.push_back(0x00); r.push_back(0x00);                       // StatusCode = 0 (success)
+    if (declineBa) { r.push_back(37); r.push_back(0x00); }      // StatusCode = 37 (REFUSED)
+    else           { r.push_back(0x00); r.push_back(0x00); }    // StatusCode = 0 (success)
     r.push_back(body[3]); r.push_back(body[4]);                 // BA Parameter Set (echo)
     r.push_back(body[5]); r.push_back(body[6]);                 // BA Timeout (echo)
 
